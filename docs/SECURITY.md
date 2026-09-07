@@ -66,6 +66,28 @@ owner exempt; `FORCE` removes that exemption. The retired system used
 remaining true. This system carries money-adjacent data and does not
 depend on that.
 
+**One documented limit.** `FORCE` removes the *owner* exemption, not the
+`BYPASSRLS` attribute. Supabase's `postgres` role carries
+`rolbypassrls = true` -- checked on the live project, not assumed -- so
+RLS does not constrain `postgres` on this platform no matter what is
+FORCEd. Two consequences, both deliberate:
+
+  - The boundary this system rests on is that **no application identity
+    is ever `postgres`**. Every runtime process authenticates as a
+    `_proc` role, and no `_proc` or `_svc` role holds `BYPASSRLS`
+    (asserted, and it is one of the migration-level assertions in the
+    database suite).
+  - Append-only claims about `system_state_history` and the provenance
+    spine are therefore scoped to the capability roles. The database
+    suite asserts exactly that, plus the fact that no `UPDATE` or
+    `DELETE` policy exists on the history table at all, so those
+    commands match no rows for every RLS-subject identity. It does not
+    assert "append-only for everyone", because on this platform that
+    would be false for `postgres`.
+
+The migration/deploy path uses `postgres` by design; it is the one
+identity that may reshape the schema, and it is not a runtime identity.
+
 ### Capability identities
 
 Two-tier: a NOLOGIN `_svc` group role holds every grant; a NOLOGIN

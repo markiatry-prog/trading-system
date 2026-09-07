@@ -5,7 +5,7 @@
 -- configuration text wherever a stronger check is practical.
 
 begin;
-select plan(26);
+select plan(29);
 
 -- ---------------------------------------------------------------------
 -- Schema placement and API surface
@@ -89,11 +89,30 @@ select is(
      and privilege_type='UPDATE'),
   0, 'the control role cannot rewrite the singleton key -- column-scoped'
 );
+-- Scoped to the capability roles, matching the provenance assertion
+-- below. It cannot be scoped wider: the table owner always holds full
+-- DML on its own table, and in Supabase `postgres` additionally carries
+-- BYPASSRLS -- verified on the live project, not assumed -- so FORCE
+-- ROW LEVEL SECURITY does not constrain it either. The boundary this
+-- system actually rests on is that no application identity is ever
+-- `postgres`; every runtime process authenticates as a `_proc` role.
+-- Asserting "append-only for everyone" would assert something false and
+-- would have to be weakened later, which is worse than stating the real
+-- boundary here.
 select is(
   (select count(*)::int from information_schema.role_table_grants
    where table_schema='trading' and table_name='system_state_history'
+     and grantee like '%\_svc'
      and privilege_type in ('UPDATE','DELETE')),
-  0, 'system_state_history is append-only for everyone'
+  0, 'no capability role may UPDATE or DELETE system_state_history'
+);
+-- The RLS half of append-only: no UPDATE or DELETE policy exists at all,
+-- so for every RLS-subject identity those commands match no rows.
+select is(
+  (select count(*)::int from pg_policies
+   where schemaname='trading' and tablename='system_state_history'
+     and cmd in ('UPDATE','DELETE')),
+  0, 'no UPDATE or DELETE policy exists on system_state_history'
 );
 
 -- ---------------------------------------------------------------------
@@ -110,92 +129,114 @@ select is(
 
 -- ---------------------------------------------------------------------
 -- The analyst / reviewer separation, asserted behaviourally.
+--
+-- The role switch goes INSIDE the SQL under test, never around the
+-- assertion. pgTAP lives in a schema the capability roles hold no USAGE
+-- on -- deliberately, since production has no pgTAP and a role must not
+-- gain a grant merely to be tested -- so calling `lives_ok` while a
+-- capability role is active fails to resolve pgTAP itself with
+-- "function lives_ok(unknown, unknown) does not exist". That aborts the
+-- plan rather than failing an assertion, which is how it hid.
+--
+-- The trailing `reset role` belongs INSIDE the executed string too, for
+-- the same reason. `lives_ok` runs the statement and then calls `ok()`
+-- to record the result -- still inside the role, since SET LOCAL in a
+-- function without its own SET clause persists to end of transaction.
+-- Resetting after the assertion returns is too late: `ok()` has already
+-- failed to resolve. `throws_ok` escapes this only incidentally, because
+-- the caught exception rolls the subtransaction back and reverts the
+-- role with it. Verified against a real cluster, both ways.
 -- ---------------------------------------------------------------------
+create function public.as_role(role_name text, stmt text) returns text
+  language sql immutable as
+  $$ select 'set local role ' || quote_ident($1) || '; ' || $2 || '; reset role' $$;
+
 set local role postgres;
 insert into trading.component_versions (id, component, version, config_digest)
   values ('11111111-1111-1111-1111-111111111111','pgtap','v1','d');
 insert into trading.runs (id, component_version_id, trigger)
   values ('22222222-2222-2222-2222-222222222222','11111111-1111-1111-1111-111111111111','pgtap');
 
-set local role analyst_svc;
 select lives_ok(
+  public.as_role('analyst_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('ai_analysis','22222222-2222-2222-2222-222222222222')$$,
+    values ('ai_analysis','22222222-2222-2222-2222-222222222222')$$),
   'analyst may author an ai_analysis'
 );
 select throws_ok(
+  public.as_role('analyst_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('adversarial_review','22222222-2222-2222-2222-222222222222')$$,
+    values ('adversarial_review','22222222-2222-2222-2222-222222222222')$$),
   '42501', NULL,
   'analyst may NOT author the adversarial review of its own work'
 );
 select throws_ok(
-  $$update trading.system_state set state='paused' where singleton$$,
+  public.as_role('analyst_svc',
+  $$update trading.system_state set state='paused' where singleton$$),
   NULL, NULL, 'analyst may not touch the kill switch'
 );
-reset role;
 
-set local role reviewer_svc;
 select lives_ok(
+  public.as_role('reviewer_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('adversarial_review','22222222-2222-2222-2222-222222222222')$$,
+    values ('adversarial_review','22222222-2222-2222-2222-222222222222')$$),
   'reviewer may author an adversarial_review'
 );
 select throws_ok(
+  public.as_role('reviewer_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('ai_analysis','22222222-2222-2222-2222-222222222222')$$,
+    values ('ai_analysis','22222222-2222-2222-2222-222222222222')$$),
   '42501', NULL,
   'reviewer may NOT author the analysis it reviews'
 );
-reset role;
 
-set local role md_ingest_svc;
 select lives_ok(
+  public.as_role('md_ingest_svc',
   $$insert into trading.artifacts (stage, run_id, observed_at, captured_at)
-    values ('market_observation','22222222-2222-2222-2222-222222222222', now(), now())$$,
+    values ('market_observation','22222222-2222-2222-2222-222222222222', now(), now())$$),
   'md_ingest may author a market_observation'
 );
 select throws_ok(
+  public.as_role('md_ingest_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('feature','22222222-2222-2222-2222-222222222222')$$,
+    values ('feature','22222222-2222-2222-2222-222222222222')$$),
   '42501', NULL, 'md_ingest may not author a feature'
 );
-reset role;
 
-set local role feature_engine_svc;
 select lives_ok(
+  public.as_role('feature_engine_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('feature','22222222-2222-2222-2222-222222222222')$$,
+    values ('feature','22222222-2222-2222-2222-222222222222')$$),
   'feature_engine may author a feature'
 );
 select throws_ok(
-  $$update trading.system_state set state='paused' where singleton$$,
+  public.as_role('feature_engine_svc',
+  $$update trading.system_state set state='paused' where singleton$$),
   NULL, NULL, 'feature_engine may not touch the kill switch'
 );
-reset role;
 
-set local role trading_control_svc;
 select lives_ok(
-  $$update trading.system_state set state='paused', changed_by='pgtap' where singleton$$,
+  public.as_role('trading_control_svc',
+  $$update trading.system_state set state='paused', changed_by='pgtap' where singleton$$),
   'the control role CAN pause the system'
 );
 select lives_ok(
-  $$update trading.system_state set state='normal', changed_by='pgtap' where singleton$$,
+  public.as_role('trading_control_svc',
+  $$update trading.system_state set state='normal', changed_by='pgtap' where singleton$$),
   'the control role CAN resume the system'
 );
 select throws_ok(
+  public.as_role('trading_control_svc',
   $$insert into trading.artifacts (stage, run_id)
-    values ('feature','22222222-2222-2222-2222-222222222222')$$,
+    values ('feature','22222222-2222-2222-2222-222222222222')$$),
   NULL, NULL, 'the control role does no pipeline work'
 );
-reset role;
 
-set local role delivery_svc;
 select lives_ok(
-  $$select state from trading.system_state$$,
+  public.as_role('delivery_svc',
+  $$select state from trading.system_state$$),
   'every pipeline identity can read the kill switch'
 );
-reset role;
 
 -- ---------------------------------------------------------------------
 -- Structural: the schema contains EXACTLY the foundation tables and
