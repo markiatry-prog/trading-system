@@ -12,6 +12,15 @@
 *service_role*
 *service-role*
 
+# ...but those four patterns match on the word, not on the contents, so
+# they also swallow source files that merely talk about credentials.
+# `scripts/provision_login_credentials.py` holds no credential material:
+# it generates passwords at run time and writes them to a file the
+# operator names (which the `.env*` rules above already cover). It was
+# silently dropped from the initial commit by the `*credential*` rule,
+# so it is re-included explicitly rather than by weakening the rule.
+!scripts/provision_login_credentials.py
+
 # Supabase CLI local state
 supabase/.branches/
 supabase/.temp/

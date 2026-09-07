@@ -126,3 +126,57 @@ def test_provisioning_never_interpolates_a_password_into_sql():
     src = inspect.getsource(prov.provision)
     assert "%s" in src, "password must be a bound parameter"
     assert "password}" not in src and "+ password" not in src
+
+
+SOURCE_SUFFIXES = {".py", ".sql", ".yml", ".yaml", ".md", ".toml", ".ini", ".sh"}
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "venv", ".venv", "node_modules"}
+
+
+def _source_files():
+    for path in ROOT.rglob("*"):
+        if path.suffix not in SOURCE_SUFFIXES or not path.is_file():
+            continue
+        if SKIP_DIRS & set(path.relative_to(ROOT).parts):
+            continue
+        yield path.relative_to(ROOT)
+
+
+def test_no_source_file_matches_an_ignore_rule():
+    """`.gitignore` carries deliberately broad secret-hygiene patterns
+    (`*credential*`, `*secret*`). Those match on the filename, not on the
+    contents, so they will happily swallow a source file that merely
+    talks about credentials -- and `git add -A` reports nothing when they
+    do. That is exactly how `scripts/provision_login_credentials.py`
+    missed the initial commit and only surfaced as a CI failure.
+
+    `--no-index` makes git evaluate the rules regardless of whether the
+    file is already tracked, so this catches a newly-added pattern that
+    traps an existing file as well as a newly-added file that walks into
+    an existing pattern."""
+    trapped = []
+    for rel in _source_files():
+        r = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", str(rel)],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            trapped.append(str(rel))
+    assert not trapped, (
+        "these source files match a .gitignore rule and would be dropped "
+        "silently from a commit; add an explicit `!` negation for each: "
+        + ", ".join(sorted(trapped))
+    )
+
+
+def test_every_script_the_guards_invoke_is_tracked_by_git():
+    """A guard whose script is not in the repository is not a guard."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "scripts/"], cwd=ROOT, capture_output=True, text=True
+    ).stdout.split()
+    for name in (
+        "check_execution_boundary.py",
+        "check_no_legacy_dependency.py",
+        "check_migration_ledger_parity.py",
+        "provision_login_credentials.py",
+    ):
+        assert f"scripts/{name}" in tracked, name
