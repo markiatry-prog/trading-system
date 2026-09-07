@@ -34,6 +34,9 @@ jobs:
 
       - name: Migration-ledger parity -- self-test
         run: python3 scripts/check_migration_ledger_parity.py --selftest
+
+      - name: Credential provisioning -- self-test
+        run: python3 scripts/provision_login_credentials.py --selftest
       - name: Migration-ledger parity -- repository half
         run: python3 scripts/check_migration_ledger_parity.py
 

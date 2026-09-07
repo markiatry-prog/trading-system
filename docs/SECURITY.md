@@ -143,3 +143,41 @@ Actual grants **are** the authority here, and CI asserts them directly
 against the matrix above. If a registry is ever introduced, it must be
 mechanically checked against effective grants including scope content —
 otherwise it must not exist.
+
+## 7. Deploy-time credential provisioning
+
+`scripts/provision_login_credentials.py` is the second half of the
+two-tier pattern. It attaches a LOGIN credential to each `_proc` role
+immediately before the process that uses it deploys.
+
+**T-001 deliberately did not run it.** Creating live credentials with no
+deployed consumer expands attack surface for zero benefit, and it would
+contradict the pattern's own rule that LOGIN arrives at deploy time. The
+mechanism is ready; firing it is a deploy step.
+
+Secret handling, by construction:
+
+- passwords are generated inside the script with
+  `secrets.token_urlsafe(32)` — never supplied, never guessable;
+- they are passed to `ALTER ROLE` as **bound parameters**, never
+  interpolated into SQL text, so they cannot reach a server query log;
+- they are never printed, logged, committed, or passed as arguments;
+- the assembled DSNs are written to one `0600` file whose path the
+  operator chooses. That file is the only place they exist outside the
+  database. Load it into the platform's variable store, then delete it.
+
+Only `_proc` roles ever receive a credential. The `_svc` group roles hold
+the grants and must remain unable to log in — asserted in the test suite,
+along with analyst and reviewer keeping separate roles and separate
+variables.
+
+```bash
+# Preview without touching anything
+python3 scripts/provision_login_credentials.py --dry-run --pooler-host <host>
+
+# Provision, at deploy time only
+python3 scripts/provision_login_credentials.py \
+    --admin-dsn <postgres-dsn> \
+    --pooler-host <pooler-host> \
+    --out /secure/trading-dsns.env
+```

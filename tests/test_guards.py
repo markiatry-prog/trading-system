@@ -88,3 +88,41 @@ def test_ledger_parity_detects_command_center_style_drift():
     drifted = [("20260903011339", "trading_foundation")]
     problems = compare(repo, drifted)
     assert len(problems) == 2  # one missing remotely, one unexpected remotely
+
+
+def test_credential_provisioning_selftest_passes():
+    """The provisioning script is the deploy-time half of the two-tier
+    role pattern. Its self-test asserts the thing most likely to drift:
+    that its capability->env-var map still matches db.py's. If those
+    disagree, a process gets a credential nothing reads."""
+    r = _run(str(SCRIPTS / "provision_login_credentials.py"), "--selftest")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SELFTEST PASSED" in r.stdout
+
+
+def test_provisioning_targets_proc_roles_never_group_roles():
+    """Group `_svc` roles hold the grants and must never be able to log
+    in. Only `_proc` roles receive credentials."""
+    sys.path.insert(0, str(SCRIPTS))
+    from provision_login_credentials import CAPABILITIES
+    for role, _ in CAPABILITIES.values():
+        assert role.endswith("_proc"), role
+        assert not role.endswith("_svc"), role
+
+
+def test_provisioning_keeps_analyst_and_reviewer_separate():
+    sys.path.insert(0, str(SCRIPTS))
+    from provision_login_credentials import CAPABILITIES
+    assert CAPABILITIES["analyst"][0] != CAPABILITIES["reviewer"][0]
+    assert CAPABILITIES["analyst"][1] != CAPABILITIES["reviewer"][1]
+
+
+def test_provisioning_never_interpolates_a_password_into_sql():
+    """Passwords are bound parameters, never formatted into the query
+    text, so they cannot reach a server log."""
+    import inspect
+    sys.path.insert(0, str(SCRIPTS))
+    import provision_login_credentials as prov
+    src = inspect.getsource(prov.provision)
+    assert "%s" in src, "password must be a bound parameter"
+    assert "password}" not in src and "+ password" not in src
