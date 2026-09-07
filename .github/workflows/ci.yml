@@ -56,9 +56,9 @@ jobs:
   database:
     name: Database security (ephemeral stack)
     runs-on: ubuntu-latest
-    # `supabase start` pulls a dozen images and has been observed hanging
-    # rather than failing. Without this the job holds a runner for the
-    # 6-hour default before anyone finds out.
+    # `supabase start` pulls a dozen images; it is by far the slowest
+    # step here and the one most exposed to a registry stall. Without a
+    # cap, a genuine hang holds a runner for the 6-hour default.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
