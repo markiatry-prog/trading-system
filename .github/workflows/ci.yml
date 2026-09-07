@@ -58,6 +58,13 @@ jobs:
       - name: Feature-engine replay demonstration
         run: python3 scripts/replay_demo.py --minutes 390
 
+      # The research framework run end to end on data with NO embedded
+      # edge. It must classify nothing ROBUST. A framework that finds
+      # signal in noise is worse than no framework, and this is the
+      # cheapest way to keep catching that.
+      - name: Research framework finds nothing in edgeless data
+        run: python3 scripts/research_demo.py
+
   database:
     name: Database security (ephemeral stack)
     runs-on: ubuntu-latest
