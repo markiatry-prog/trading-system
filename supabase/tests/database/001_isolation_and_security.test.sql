@@ -198,15 +198,21 @@ select lives_ok(
 reset role;
 
 -- ---------------------------------------------------------------------
--- Structural: none of the retired organizational tables exist here.
+-- Structural: the schema contains EXACTLY the foundation tables and
+-- nothing else.
+--
+-- Expressed as an allow-list rather than a deny-list of the retired
+-- system's organizational tables. That is deliberately stronger: a
+-- deny-list only catches the nine names someone thought to write down,
+-- while this catches any unexpected table -- an organizational
+-- abstraction under a new name, a premature pipeline table, or a
+-- forgotten scratch table.
 -- ---------------------------------------------------------------------
-select is(
-  (select count(*)::int from information_schema.tables
-   where table_schema='trading'
-     and table_name in ('tasks','objectives','initiatives','departments',
-                        'attention_queue','approval_queue','context_facts',
-                        'conversation_turns','capability_policies')),
-  0, 'no Command Center organizational abstraction was recreated'
+select set_eq(
+  $$select table_name::text from information_schema.tables where table_schema='trading'$$,
+  $$values ('system_state'),('system_state_history'),('component_versions'),
+           ('model_versions'),('runs'),('artifacts'),('artifact_edges')$$,
+  'the trading schema holds exactly the seven foundation tables'
 );
 select is(
   (select count(*)::int from pg_constraint c
