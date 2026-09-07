@@ -195,11 +195,30 @@ variables.
 
 ```bash
 # Preview without touching anything
-python3 scripts/provision_login_credentials.py --dry-run --pooler-host <host>
+python3 scripts/provision_login_credentials.py --dry-run \
+    --pooler-host <host> --project-ref <ref>
 
 # Provision, at deploy time only
 python3 scripts/provision_login_credentials.py \
     --admin-dsn <postgres-dsn> \
     --pooler-host <pooler-host> \
+    --project-ref <project-ref> \
     --out /secure/trading-dsns.env
 ```
+
+Two details of the emitted DSN are load-bearing, and both were wrong in
+the first version of this script:
+
+- **The username is `<role>.<project-ref>`, not `<role>`.** Supabase
+  fronts Postgres with Supavisor, which multiplexes many projects behind
+  one hostname and so authenticates on the tenant-qualified name. A bare
+  role name parses as a perfectly valid DSN and then fails at connect
+  time, meaning the mistake surfaces only at the deploy healthcheck --
+  after seven live credentials have been minted. The script now refuses
+  to run against a pooler host without `--project-ref`.
+- **Port 5432 (session mode), not 6543 (transaction mode).** Transaction
+  mode does not support session-level features, `SET` among them. Every
+  authority boundary here is role-scoped, so a pooling mode that forbids
+  `SET ROLE` is a trap for every stage built on this foundation, even
+  though the current health read does not happen to need it. `--port`
+  overrides this for a genuinely short-lived consumer.

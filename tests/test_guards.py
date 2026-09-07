@@ -180,3 +180,30 @@ def test_every_script_the_guards_invoke_is_tracked_by_git():
         "provision_login_credentials.py",
     ):
         assert f"scripts/{name}" in tracked, name
+
+
+def test_provisioning_puts_the_project_ref_in_the_dsn_username():
+    """Supavisor multiplexes projects behind one hostname and
+    authenticates on `<role>.<project-ref>`. A bare role name parses as a
+    valid DSN and then fails at connect time -- which would surface only
+    at the deploy healthcheck, after seven live credentials had been
+    minted. Asserted, not trusted."""
+    sys.path.insert(0, str(SCRIPTS))
+    from provision_login_credentials import build_dsn
+    dsn = build_dsn("analyst_proc", "pw", "aws-0-x.pooler.supabase.com", "abc123")
+    assert dsn.startswith("postgresql://analyst_proc.abc123:"), dsn
+    # and still supports a direct endpoint, where the bare role is right
+    assert build_dsn("analyst_proc", "pw", "db.x.supabase.co").startswith(
+        "postgresql://analyst_proc:")
+
+
+def test_provisioning_defaults_to_session_mode_not_transaction_mode():
+    """Transaction mode (6543) cannot run `SET`. Every authority boundary
+    in this system is role-scoped, so defaulting to a mode that forbids
+    `SET ROLE` would be a trap for every stage built on this foundation."""
+    sys.path.insert(0, str(SCRIPTS))
+    import provision_login_credentials as prov
+    assert prov.POOLER_PORT == prov.POOLER_PORT_SESSION == 5432
+    assert prov.POOLER_PORT_TRANSACTION == 6543
+    port = prov.build_dsn("r", "p", "h").rsplit(":", 1)[1].split("/")[0]
+    assert port == "5432", port
