@@ -1,2 +1,8 @@
 -r requirements.txt
 pytest>=8,<9
+
+# NOT listed as an install: `databento` is needed only by the operator
+# running scripts/databento_cost_estimate.py, and CI never imports it.
+# Installing it here would add supply-chain surface to every build for a
+# package no test uses. Install it ad hoc when pricing a pull:
+#     pip install "databento>=0.34"

@@ -207,3 +207,27 @@ def test_provisioning_defaults_to_session_mode_not_transaction_mode():
     assert prov.POOLER_PORT_TRANSACTION == 6543
     port = prov.build_dsn("r", "p", "h").rsplit(":", 1)[1].split("/")[0]
     assert port == "5432", port
+
+
+def test_cost_script_cannot_download():
+    """The Phase B cost script must remain incapable of spending money.
+
+    metadata.get_cost and list_unit_prices are free. timeseries.get_range
+    and batch.submit_job are what cost money, and neither may appear --
+    an accidental download is the one failure this whole gate exists to
+    prevent."""
+    src = (SCRIPTS / "databento_cost_estimate.py").read_text()
+    code_lines = [ln for ln in src.splitlines()
+                  if not ln.strip().startswith("#")]
+    code = "\n".join(code_lines)
+    # Strip the module docstring, which names the forbidden calls in order
+    # to explain why they are absent.
+    if '"""' in code:
+        first = code.index('"""')
+        second = code.index('"""', first + 3)
+        code = code[:first] + code[second + 3:]
+    for forbidden in ("get_range", "submit_job", "timeseries.", "batch."):
+        assert forbidden not in code, (
+            f"{forbidden} appears in the cost script; it must only make "
+            f"free metadata calls")
+    assert "get_cost" in code and "list_unit_prices" in code
