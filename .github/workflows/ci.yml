@@ -1,0 +1,115 @@
+name: CI
+
+# Every job here is BLOCKING. The guards in particular are not advisory:
+# a failure means a security boundary this system depends on has been
+# crossed, and the merge stops.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  guards:
+    name: Security guards (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The guards' own fixture self-tests run FIRST. A guard that no
+      # longer catches what it claims to catch is worse than no guard,
+      # because it looks like protection.
+      - name: Execution-boundary guard -- self-test
+        run: python3 scripts/check_execution_boundary.py --selftest
+      - name: Execution-boundary guard -- scan entire repository
+        run: python3 scripts/check_execution_boundary.py .
+
+      - name: Command Center isolation guard -- self-test
+        run: python3 scripts/check_no_legacy_dependency.py --selftest
+      - name: Command Center isolation guard -- scan entire repository
+        run: python3 scripts/check_no_legacy_dependency.py .
+
+      - name: Migration-ledger parity -- self-test
+        run: python3 scripts/check_migration_ledger_parity.py --selftest
+      - name: Migration-ledger parity -- repository half
+        run: python3 scripts/check_migration_ledger_parity.py
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests/ -v
+
+  database:
+    name: Database security (ephemeral stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v3
+        with:
+          version: latest
+
+      # Ephemeral, rebuilt from migrations alone, torn down at job end.
+      # No production secret is available to this job, by construction.
+      - name: Start local Supabase stack
+        run: supabase start
+
+      - name: Rebuild schema from migrations only
+        run: supabase db reset
+
+      # pgTAP lives here and ONLY here. It is never installed into the
+      # production application schema.
+      - name: Run database security suite
+        run: supabase test db
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          supabase status > ci-logs/status.txt 2>&1 || true
+          docker ps -a > ci-logs/docker.txt 2>&1 || true
+          for c in $(docker ps -a --format '{{.Names}}' | grep '^supabase_' || true); do
+            docker logs "$c" > "ci-logs/$c.log" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ci-logs
+          path: ci-logs
+          retention-days: 7
+
+      - name: Stop stack
+        if: always()
+        run: supabase stop
+
+  container:
+    name: Container builds and serves health
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t trading-system:ci .
+      # Proves the deployable actually starts and answers. With no
+      # database configured it must report unreachable and 503 rather
+      # than crash -- a health endpoint that can fail is not one.
+      - name: Health endpoint responds without a database
+        run: |
+          docker run -d --name ts -p 8080:8080 trading-system:ci
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /tmp/body -w '%{http_code}' http://localhost:8080/health || true)
+            if [ -n "$code" ] && [ "$code" != "000" ]; then break; fi
+            sleep 1
+          done
+          echo "status=$code"; cat /tmp/body; echo
+          test "$code" = "503"
+          grep -q '"reachable": false' /tmp/body
+          grep -q '"state": "paused"' /tmp/body
+          docker rm -f ts

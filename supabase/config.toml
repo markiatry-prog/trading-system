@@ -1,0 +1,26 @@
+# Supabase CLI configuration for the trading system.
+project_id = "trading-system"
+
+[db]
+major_version = 17
+
+[db.pooler]
+enabled = true
+
+[api]
+enabled = true
+port = 54321
+# `trading` is deliberately ABSENT. Application tables must not be
+# reachable through PostgREST: the API surface for this project is empty
+# by design, and adding a schema here is a security decision requiring
+# its own review.
+schemas = ["public"]
+extra_search_path = ["public"]
+max_rows = 1000
+
+[studio]
+enabled = true
+port = 54323
+
+[edge_runtime]
+enabled = false
