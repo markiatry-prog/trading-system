@@ -52,6 +52,11 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -v
+      # Replay determinism, prefix-invariance (the lookahead proof)
+      # and provenance completeness, as an executable artefact
+      # rather than only as assertions.
+      - name: Feature-engine replay demonstration
+        run: python3 scripts/replay_demo.py --minutes 390
 
   database:
     name: Database security (ephemeral stack)
@@ -107,6 +112,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t trading-system:ci .
+
+      # The IANA database is not present in python:3.11-slim by default.
+      # Without it every session boundary silently misresolves, so this
+      # asserts it inside the image that actually ships rather than on
+      # the runner, which has its own system tzdata and would pass
+      # regardless.
+      - name: Time zone database is present in the deployed image
+        run: |
+          docker run --rm trading-system:ci python -c "
+          from zoneinfo import ZoneInfo
+          from datetime import datetime
+          ny = ZoneInfo('America/New_York')
+          winter = datetime(2026, 1, 15, 9, 30, tzinfo=ny).utcoffset()
+          summer = datetime(2026, 7, 15, 9, 30, tzinfo=ny).utcoffset()
+          assert winter != summer, 'DST not applied -- tzdata is stale or missing'
+          print('tzdata OK:', winter, summer)
+          "
       # Proves the deployable actually starts and answers. With no
       # database configured it must report unreachable and 503 rather
       # than crash -- a health endpoint that can fail is not one.

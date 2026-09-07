@@ -5,7 +5,7 @@
 -- configuration text wherever a stronger check is practical.
 
 begin;
-select plan(29);
+select plan(32);
 
 -- ---------------------------------------------------------------------
 -- Schema placement and API surface
@@ -252,8 +252,41 @@ select lives_ok(
 select set_eq(
   $$select table_name::text from information_schema.tables where table_schema='trading'$$,
   $$values ('system_state'),('system_state_history'),('component_versions'),
-           ('model_versions'),('runs'),('artifacts'),('artifact_edges')$$,
-  'the trading schema holds exactly the seven foundation tables'
+           ('model_versions'),('runs'),('artifacts'),('artifact_edges'),
+           ('feature_configs'),('features')$$,
+  'the trading schema holds exactly the foundation and feature-store tables'
+);
+
+-- ---------------------------------------------------------------------
+-- T-003 feature store.
+-- ---------------------------------------------------------------------
+select is(
+  (select count(*)::int from information_schema.role_table_grants
+   where table_schema='trading' and table_name in ('features','feature_configs')
+     and grantee like '%\_svc'
+     and privilege_type in ('UPDATE','DELETE')),
+  0, 'the feature store is append-only for every capability role'
+);
+select is(
+  (select count(*)::int from information_schema.role_table_grants
+   where table_schema='trading' and table_name='features'
+     and privilege_type='INSERT' and grantee like '%\_svc'
+     and grantee <> 'feature_engine_svc'),
+  0, 'only the feature engine may write features'
+);
+-- The constraint is the lookahead invariant, enforced below the Python
+-- layer so a future writer cannot bypass it.
+select throws_ok(
+  public.as_role('postgres',
+  $$insert into trading.features
+      (run_id, config_id, instrument_symbol, kind, type, session_date,
+       effective_at, available_at, inputs_digest)
+    values ('22222222-2222-2222-2222-222222222222',
+            '33333333-3333-3333-3333-333333333333',
+            'NQZ6','feature','vwap','2026-01-12',
+            '2026-01-12T15:00:00Z','2026-01-12T14:59:00Z','d')$$),
+  '23514', NULL,
+  'a feature knowable before it is true is rejected by the database'
 );
 select is(
   (select count(*)::int from pg_constraint c

@@ -1,3 +1,7 @@
 # Runtime. Deliberately minimal: T-001 is a foundation, and every
 # dependency added here is one the ingestion and analysis tickets inherit.
 psycopg2-binary>=2.9,<3
+tzdata>=2024.1
+# The IANA time zone database. python:3.11-slim ships without it,
+# and zoneinfo then fails to resolve America/New_York -- which
+# would break every session boundary and opening range.
