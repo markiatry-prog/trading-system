@@ -117,39 +117,27 @@ def test_results_cannot_attach_to_an_unregistered_hypothesis():
 
 
 # --- data quality -----------------------------------------------------
-
-def _day_bars(n, volume=100):
-    return [bar(i, 20000 + i, 20002 + i, 19998 + i, 20001 + i, volume=volume)
-            for i in range(n)]
-
-
-def test_a_good_day_passes():
-    q = assess_day(date(2026, 1, 12), "NQZ6", _day_bars(390))
-    assert q.passed and not q.reasons
+#
+# The gate was redesigned after the first real-data run excluded 695 of
+# 1,256 sessions on a heuristic that mis-read normal market structure.
+# It is now tested in full in tests/test_quality_gate.py, against the
+# five-way distinction between legitimate silence, session structure,
+# early closes, true feed gaps and known degraded dates. The report's
+# role in a study is what is checked here.
 
 
-def test_a_short_day_is_excluded_with_a_stated_reason():
-    q = assess_day(date(2026, 1, 12), "NQZ6", _day_bars(100))
-    assert not q.passed
-    assert any("bars" in r for r in q.reasons)
-
-
-def test_a_bad_print_is_detected():
-    bars = _day_bars(390)
-    bars[100] = bar(100, 20100, 30000, 20090, 20105)   # absurd range
-    q = assess_day(date(2026, 1, 12), "NQZ6", bars)
-    assert not q.passed
-    assert any("bad print" in r or "median" in r for r in q.reasons)
-
-
-def test_quality_report_states_the_honest_denominator():
+def test_the_report_supplies_an_honest_denominator_to_a_study():
+    from trading_system.features.calendar import SessionCalendar
+    from trading_system.features.config import SessionSpec
+    from trading_system.research.quality import assess_day
+    calendar = SessionCalendar(SessionSpec())
     report = QualityReport()
-    for i in range(10):
-        report.add(assess_day(date(2026, 1, 5) + timedelta(days=i), "NQZ6",
-                              _day_bars(390 if i < 7 else 50)))
+    for i in range(4):
+        report.add(assess_day(date(2026, 1, 12), "NQZ6", [], calendar))
     s = report.summary()
-    assert s["days_assessed"] == 10 and s["days_passed"] == 7
-    assert s["days_excluded"] == 3 and s["exclusion_reasons"]
+    assert s["days_assessed"] == 4
+    assert s["days_passed"] == 0
+    assert s["exclusion_reasons"], "an exclusion must state its rule"
 
 
 # --- forward paths ----------------------------------------------------

@@ -62,13 +62,15 @@ def main() -> int:
     print("Phase A research framework -- synthetic data, no embedded edge\n")
 
     # 1. build sessions and gate quality BEFORE anything is measured
+    from trading_system.features.calendar import SessionCalendar
+    calendar = SessionCalendar(FeatureConfig().session)
     quality = QualityReport()
     per_day = {}
     for d in range(n_days):
         if (datetime(2026, 1, 5) + timedelta(days=d)).weekday() >= 5:
             continue
         day, bars = session_bars(d)
-        quality.add(assess_day(day, "NQZ6", bars))
+        quality.add(assess_day(day, "NQZ6", bars, calendar))
         per_day[day] = bars
     q = quality.summary()
     print(f"1. data quality: {q['days_passed']}/{q['days_assessed']} days passed, "

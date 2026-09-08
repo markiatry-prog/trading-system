@@ -137,13 +137,15 @@ def main() -> int:
     print("3. data-quality gate (before any statistic)")
     quality = QualityReport()
     for day, day_bars in sorted(by_day.items()):
-        quality.add(assess_day(day, instrument.symbol, day_bars,
-                               expected_bars=1380))
+        quality.add(assess_day(day, instrument.symbol, day_bars, calendar))
     q = quality.summary()
     print(f"   {q['days_passed']}/{q['days_assessed']} days passed, "
           f"{q['days_excluded']} excluded")
-    for reason, n in sorted(q["exclusion_reasons"].items()):
-        print(f"     {n:>5}  {reason}")
+    for reason, n in sorted(q["exclusion_reasons"].items(),
+                            key=lambda kv: -kv[1]):
+        print(f"     {n:>5}  EXCLUDED  {reason}")
+    for obs, n in sorted(q["observations"].items(), key=lambda kv: -kv[1]):
+        print(f"     {n:>5}  observed  {obs}")
     usable = quality.passed_days
     if len(usable) < 30:
         raise SystemExit(f"only {len(usable)} usable days; refusing to compute")
