@@ -66,6 +66,9 @@ def mechanism(day: date, entry: dict) -> tuple:
     if unknown:
         return "unexplained", f"gate fired {unknown}, which this script cannot name"
 
+    if "no_data" in rules:
+        return "no_data", RULE_MECHANISM["no_data"]
+
     coverage_like = {"no_data", "rth_coverage", "rth_contiguous_gap"}
     integrity = [r for r in rules if r not in coverage_like]
 
@@ -155,7 +158,7 @@ def main() -> int:
     for d in excluded:
         fam, why = detail[d]
         if fam in ("data_integrity", "feed_gap", "calendar_shortfall",
-                   "unexplained"):
+                   "no_data", "unexplained"):
             print(f"\n  {d} ({d.strftime('%A')}) -- {fam}")
             print(f"    {why}")
             print(f"    bars={by_day[d]['bars']} rth_bars={by_day[d]['rth_bars']} "

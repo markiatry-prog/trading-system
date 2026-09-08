@@ -305,3 +305,26 @@ def test_the_analyzer_treats_the_expiry_calendar_only_as_a_cross_check():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "is_quarterly_expiry" not in called
     assert "expiries_between" not in called
+
+
+def test_a_session_with_no_tape_is_named_as_such():
+    m = _analyzer()
+    family, _ = m.mechanism(
+        date(2025, 7, 15),
+        {"new_gate_exclusions": ["no_data"], "expected_rth_minutes": 390})
+    assert family == "no_data"
+
+
+def test_no_excluded_session_can_be_unexplained_by_a_known_rule():
+    """The property that closes the 2025/2026 gap: for every rule the
+    gate can fire, on any day, the attribution is a name."""
+    from trading_system.research.quality import ExclusionRule
+    m = _analyzer()
+    for rule in ExclusionRule:
+        for day in (date(2025, 3, 21), date(2025, 7, 15), date(2026, 6, 19)):
+            for expected in (390, 210):
+                fam, why = m.mechanism(
+                    day, {"new_gate_exclusions": [rule.value],
+                          "expected_rth_minutes": expected})
+                assert fam != "unexplained", f"{rule.value} on {day}"
+                assert why
