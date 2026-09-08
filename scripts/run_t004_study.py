@@ -83,18 +83,31 @@ def main() -> int:
 
     instrument = INSTRUMENTS[args.symbol]
     captured_at = datetime.fromisoformat(manifest["finished_at"])
-    source = DatabentoFileSource(data_dir / manifest["file"], instrument,
+    # ALL symbols are handed to the source, because one DBN file holds
+    # every symbol that was requested together and they are separated
+    # only by instrument_id. Passing a single instrument would pool three
+    # contracts at three price levels into one series.
+    source = DatabentoFileSource(data_dir / manifest["file"], INSTRUMENTS,
                                  captured_at)
 
-    print(f"2. normalising {args.symbol} ...")
-    lo = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    hi = datetime(2100, 1, 1, tzinfo=timezone.utc)
-    from trading_system.market_data import MarketDataSchema
-    bars = [b for b in source.history(instrument, MarketDataSchema.BARS, lo, hi)
-            if b.instrument.symbol == instrument.symbol]
-    print(f"   {len(bars):,} bars\n")
+    print("2. normalising and splitting by instrument ...")
+    by_symbol = source.bars_by_symbol()
+    for sym in sorted(by_symbol):
+        print(f"   {sym:9} {len(by_symbol[sym]):>10,} bars")
+    bars = by_symbol[instrument.symbol]
+    print(f"   using {instrument.symbol}\n")
     if not bars:
         raise SystemExit("no bars for this symbol; check the acquisition")
+
+    # A session cannot contain more bars than it has minutes. If it does,
+    # instruments have been pooled and every level computed would be
+    # meaningless.
+    span_days = (bars[-1].observed_at - bars[0].observed_at).days or 1
+    per_day = len(bars) / max(1, span_days * 5 / 7)
+    if per_day > 1440:
+        raise SystemExit(
+            f"{per_day:,.0f} bars per trading day exceeds the 1,440 minutes "
+            f"one day contains. Instruments are pooled; refusing to compute.")
 
     config = FeatureConfig()
     calendar = FeatureEngine(instrument, config).calendar

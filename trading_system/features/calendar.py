@@ -44,7 +44,41 @@ class SessionPhase(str, Enum):
 # US equity-index futures holidays and early closes, by year. Early close
 # maps a date to the local closing time. A year absent from this mapping
 # is UNKNOWN, not clean -- see `is_known_year`.
+# US equity-index futures holidays, by year, following the NYSE calendar
+# that CME equity-index RTH tracks. Data, not code: auditable, diffable,
+# and versioned with the study that used it.
+#
+# A year absent from this mapping is UNKNOWN, not clean -- see
+# `is_known_year`. That distinction is the whole point and it has already
+# earned its place: the first real-data run refused rather than treating
+# 2021 as holiday-free.
+#
+# THREE OBSERVANCE RULES THAT LOOK LIKE OMISSIONS AND ARE NOT
+#   - Juneteenth appears from 2022. It became a federal holiday in June
+#     2021, but the exchanges first observed it in 2022, and 2021-06-19
+#     was a Saturday regardless.
+#   - 2022 has no New Year holiday. 2022-01-01 was a Saturday and the
+#     exchanges did not shift the observance to an adjacent weekday.
+#   - Christmas 2021 is listed as 2021-12-24 (Friday), the observed day,
+#     because 2021-12-25 was a Saturday.
+# Every date below was checked against its weekday before being written.
 HOLIDAYS = {
+    2021: {
+        date(2021, 1, 1), date(2021, 1, 18), date(2021, 2, 15),
+        date(2021, 4, 2), date(2021, 5, 31), date(2021, 7, 5),
+        date(2021, 9, 6), date(2021, 11, 25), date(2021, 12, 24),
+    },
+    2022: {
+        date(2022, 1, 17), date(2022, 2, 21), date(2022, 4, 15),
+        date(2022, 5, 30), date(2022, 6, 20), date(2022, 7, 4),
+        date(2022, 9, 5), date(2022, 11, 24), date(2022, 12, 26),
+    },
+    2023: {
+        date(2023, 1, 2), date(2023, 1, 16), date(2023, 2, 20),
+        date(2023, 4, 7), date(2023, 5, 29), date(2023, 6, 19),
+        date(2023, 7, 4), date(2023, 9, 4), date(2023, 11, 23),
+        date(2023, 12, 25),
+    },
     2024: {
         date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19),
         date(2024, 3, 29), date(2024, 5, 27), date(2024, 6, 19),
@@ -65,7 +99,15 @@ HOLIDAYS = {
     },
 }
 
+# Early closes: 13:00 local. Two recurring cases -- the day after
+# Thanksgiving, and the day before Independence Day when that day is
+# itself a trading day. Christmas Eve is an early close only when it
+# falls on a weekday and is not itself the observed holiday, which is why
+# 2021, 2022 and 2023 have none.
 EARLY_CLOSES = {
+    2021: {date(2021, 11, 26): time(13, 0)},
+    2022: {date(2022, 11, 25): time(13, 0)},
+    2023: {date(2023, 7, 3): time(13, 0), date(2023, 11, 24): time(13, 0)},
     2024: {date(2024, 7, 3): time(13, 0), date(2024, 11, 29): time(13, 0),
            date(2024, 12, 24): time(13, 0)},
     2025: {date(2025, 7, 3): time(13, 0), date(2025, 11, 28): time(13, 0),
@@ -73,9 +115,12 @@ EARLY_CLOSES = {
     2026: {date(2026, 11, 27): time(13, 0), date(2026, 12, 24): time(13, 0)},
 }
 
+COVERED_YEARS = tuple(sorted(HOLIDAYS))
+
 
 class CalendarError(Exception):
-    pass
+    """Raised rather than guessing. An uncovered year must stop a study,
+    not be silently treated as free of holidays and early closes."""
 
 
 def is_known_year(year: int) -> bool:

@@ -159,7 +159,8 @@ def test_the_adapter_is_importable_without_the_databento_library():
 
 def test_source_refuses_a_schema_it_does_not_provide():
     from trading_system.market_data import MarketDataSchema
-    s = DatabentoFileSource("x.dbn", NQ, datetime(2026, 9, 8, tzinfo=timezone.utc))
+    s = DatabentoFileSource("x.dbn", {"NQ.c.0": NQ},
+                            datetime(2026, 9, 8, tzinfo=timezone.utc))
     with pytest.raises(MarketDataError, match="ohlcv-1m"):
         list(s.history(NQ, MarketDataSchema.TRADES,
                        datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -210,3 +211,105 @@ def test_tampered_data_file_is_detected(tmp_path):
     (tmp_path / "d.dbn.zst").write_bytes(b"tampered bytes")
     with pytest.raises(SystemExit, match="INTEGRITY FAILURE"):
         STUDY.verify_manifest(tmp_path)
+
+
+# --- instrument separation (the pooling defect) ------------------------
+
+class _Rec:
+    def __init__(self, iid, ts, price):
+        self.instrument_id = iid
+        self.ts_event = ts
+        self.open = self.high = self.low = self.close = price
+        self.volume = 10
+
+
+def _three_instrument_source():
+    from trading_system.sources.databento_source import DatabentoFileSource
+    instruments = {
+        "NQ.c.0": Instrument(symbol="NQ.c.0", product="NQ", tick_size=Decimal("0.25")),
+        "MNQ.c.0": Instrument(symbol="MNQ.c.0", product="MNQ", tick_size=Decimal("0.25")),
+        "ES.c.0": Instrument(symbol="ES.c.0", product="ES", tick_size=Decimal("0.25")),
+    }
+    return DatabentoFileSource("f.dbn", instruments,
+                               datetime(2026, 9, 8, tzinfo=timezone.utc))
+
+
+def test_records_are_split_by_their_real_instrument_not_the_caller_s():
+    """The defect this pins: one DBN file interleaves every requested
+    symbol, distinguished only by instrument_id. Assigning the caller's
+    instrument to every record pooled NQ, MNQ and ES into one series at
+    three different price levels."""
+    src = _three_instrument_source()
+    base = 1757342400000000000
+    records = [
+        _Rec(1, base, 20000000000000),          # NQ  @ 20000
+        _Rec(2, base, 20000000000000),          # MNQ @ 20000
+        _Rec(3, base, 5600000000000),           # ES  @ 5600
+        _Rec(1, base + 60_000_000_000, 20001000000000),
+        _Rec(3, base + 60_000_000_000, 5601000000000),
+    ]
+    resolver = {1: "NQ.c.0", 2: "MNQ.c.0", 3: "ES.c.0"}.get
+    out = src.bars_by_symbol(records=records, resolver=lambda i: resolver(i, ""))
+    assert len(out["NQ.c.0"]) == 2
+    assert len(out["MNQ.c.0"]) == 1
+    assert len(out["ES.c.0"]) == 2
+    assert all(b.instrument.symbol == "NQ.c.0" for b in out["NQ.c.0"])
+    assert out["ES.c.0"][0].close == Decimal("5600")
+
+
+def test_an_unrecognised_symbol_is_refused_not_dropped():
+    """Silently dropping records would change the sample without saying so."""
+    src = _three_instrument_source()
+    records = [_Rec(9, 1757342400000000000, 100000000000)]
+    with pytest.raises(MarketDataError, match="not in this source"):
+        src.bars_by_symbol(records=records, resolver=lambda i: "RTY.c.0")
+
+
+def test_backwards_time_within_one_symbol_is_refused():
+    src = _three_instrument_source()
+    base = 1757342400000000000
+    records = [_Rec(1, base + 60_000_000_000, 20001000000000),
+               _Rec(1, base, 20000000000000)]
+    with pytest.raises(MarketDataError, match="backwards in time"):
+        src.bars_by_symbol(records=records, resolver=lambda i: "NQ.c.0")
+
+
+def test_interleaving_across_symbols_is_not_mistaken_for_backwards_time():
+    """Symbols are interleaved in the file; each series is ordered only
+    within itself. Checking order globally would reject a valid file."""
+    src = _three_instrument_source()
+    base = 1757342400000000000
+    records = [_Rec(1, base + 60_000_000_000, 20001000000000),
+               _Rec(3, base, 5600000000000)]
+    out = src.bars_by_symbol(records=records,
+                             resolver=lambda i: {1: "NQ.c.0", 3: "ES.c.0"}[i])
+    assert len(out["NQ.c.0"]) == 1 and len(out["ES.c.0"]) == 1
+
+
+def test_resolver_refuses_a_file_it_cannot_map():
+    from trading_system.sources.databento_source import build_symbol_resolver
+
+    class Meta:
+        mappings = []
+        symbols = ["NQ.c.0", "ES.c.0"]
+
+    class Store:
+        symbology_map = {}
+        metadata = Meta()
+
+    with pytest.raises(MarketDataError, match="Refusing to guess"):
+        build_symbol_resolver(Store())
+
+
+def test_resolver_accepts_a_single_symbol_file():
+    from trading_system.sources.databento_source import build_symbol_resolver
+
+    class Meta:
+        mappings = []
+        symbols = ["NQ.c.0"]
+
+    class Store:
+        symbology_map = {}
+        metadata = Meta()
+
+    assert build_symbol_resolver(Store())(123) == "NQ.c.0"
