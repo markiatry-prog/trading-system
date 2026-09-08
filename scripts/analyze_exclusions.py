@@ -116,8 +116,25 @@ def continuity(day: date, prior: date, by_day: dict) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fixture", default="quality_fixture.json")
+    ap = argparse.ArgumentParser(
+        description="Name the mechanism behind every session the quality "
+                    "gate excluded, and audit contract continuity for the "
+                    "prior-session hypotheses. Reads only the anonymised "
+                    "fixture: no dataset, no prices, no network.",
+        epilog="Generate the fixture first:\n"
+               "  python scripts/diagnose_quality_gate.py "
+               "--data-dir data/t004 --symbol NQ.c.0 "
+               "--fixture-out quality_fixture.json\n\n"
+               "Exit status: 0 if both sections ran; 1 if the fixture "
+               "carries no contract labels, in which case the quality "
+               "attribution above it is still complete and only the "
+               "continuity audit was skipped.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fixture", default="quality_fixture.json",
+                    metavar="PATH",
+                    help="the quality_fixture.json written by "
+                         "diagnose_quality_gate.py (default: %(default)s "
+                         "in the current directory)")
     args = ap.parse_args()
 
     fixture = json.loads(Path(args.fixture).read_text())
