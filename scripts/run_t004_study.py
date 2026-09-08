@@ -90,24 +90,42 @@ def main() -> int:
     source = DatabentoFileSource(data_dir / manifest["file"], INSTRUMENTS,
                                  captured_at)
 
-    print("2. normalising and splitting by instrument ...")
+    print("2. resolving symbology and splitting by instrument ...")
     by_symbol = source.bars_by_symbol()
+    total_kept = 0
     for sym in sorted(by_symbol):
-        print(f"   {sym:9} {len(by_symbol[sym]):>10,} bars")
+        series = by_symbol[sym]
+        total_kept += len(series)
+        if not series:
+            print(f"   {sym:9} {0:>10,} bars")
+            continue
+        span = (series[-1].observed_at - series[0].observed_at).days or 1
+        per_session = len(series) / max(1, span * 5 / 7)
+        # A session cannot contain more bars than it has minutes. If it
+        # does, instruments have been pooled and every level, VWAP and
+        # excursion computed from the series would be meaningless.
+        flag = "  POOLED" if per_session > 1440 else ""
+        print(f"   {sym:9} {len(series):>10,} bars  "
+              f"{per_session:>7,.0f}/session{flag}")
+        if per_session > 1440:
+            raise SystemExit(
+                f"{sym}: {per_session:,.0f} bars per trading day exceeds the "
+                f"1,440 minutes a day contains. Instruments are pooled; "
+                f"refusing to compute.")
+
+    # Nothing lost, nothing duplicated.
+    read = getattr(source, "last_record_total", None)
+    if read is not None:
+        print(f"   reconciliation: {total_kept:,} kept of {read:,} read")
+        if total_kept != read:
+            raise SystemExit(
+                f"{read - total_kept:,} records were neither kept nor "
+                f"refused; the sample would silently differ from the file.")
+
     bars = by_symbol[instrument.symbol]
     print(f"   using {instrument.symbol}\n")
     if not bars:
         raise SystemExit("no bars for this symbol; check the acquisition")
-
-    # A session cannot contain more bars than it has minutes. If it does,
-    # instruments have been pooled and every level computed would be
-    # meaningless.
-    span_days = (bars[-1].observed_at - bars[0].observed_at).days or 1
-    per_day = len(bars) / max(1, span_days * 5 / 7)
-    if per_day > 1440:
-        raise SystemExit(
-            f"{per_day:,.0f} bars per trading day exceeds the 1,440 minutes "
-            f"one day contains. Instruments are pooled; refusing to compute.")
 
     config = FeatureConfig()
     calendar = FeatureEngine(instrument, config).calendar

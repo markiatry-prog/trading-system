@@ -16,7 +16,7 @@ starts failing intermittently.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import (Callable, Dict, Iterable, Iterator, List, Mapping,
                     Optional, Sequence)
@@ -68,52 +68,82 @@ def normalize_ohlcv(record, instrument: Instrument, captured_at: datetime,
     )
 
 
-def build_symbol_resolver(store) -> Callable[[int], str]:
-    """instrument_id -> symbol, from the file's own symbology.
+class SymbologyError(MarketDataError):
+    """Raised when a record's instrument cannot be identified."""
 
-    THIS IS NOT OPTIONAL. A multi-symbol DBN file interleaves every
-    requested instrument in one stream, distinguished ONLY by
-    instrument_id. Assigning the caller's instrument to every record
-    silently pools NQ, MNQ and ES into a single series at three
-    different price levels -- which is exactly the defect that produced
-    "5,272,572 bars" for one symbol when an ETH session holds 1,380
-    minutes. Every level, VWAP and excursion computed from that would
-    have been meaningless, and nothing downstream could have detected it.
 
-    Several databento-python versions expose the mapping differently, so
-    each is tried in turn and the failure is loud rather than falling
-    back to a guess.
+class DictResolver:
+    """Date-aware resolver backed by an explicit table. Used in tests, and
+    a precise statement of the interface the real one implements."""
+
+    def __init__(self, table: Mapping[int, str]):
+        self._table = {int(k): str(v) for k, v in table.items()}
+
+    def resolve(self, instrument_id: int, on: date) -> Optional[str]:
+        return self._table.get(int(instrument_id))
+
+    def observe(self, record) -> None:      # no symbol-mapping messages
+        return None
+
+
+class InstrumentMapResolver:
+    """Wraps databento's own `InstrumentMap`.
+
+    WHY DATE-AWARE RESOLUTION IS NOT OPTIONAL. A continuous symbol like
+    NQ.c.0 is not one contract: it is whichever contract is front month
+    on a given day, and the instrument_id therefore CHANGES at every
+    quarterly roll. A flat instrument_id -> symbol dict is right until
+    the first roll and wrong afterwards, in a way that shows up as a
+    price discontinuity rather than an error.
+
+    `metadata.mappings` is a dict keyed by the INPUT symbol, whose
+    entries carry the output symbol plus a start/end date -- not a list
+    of objects with `.raw_symbol` and `.intervals`, which is what the
+    previous implementation guessed at and why it resolved nothing.
     """
-    mapping = getattr(store, "symbology_map", None)
-    if mapping:
-        table = {int(k): str(v) for k, v in dict(mapping).items()}
-        if table:
-            return lambda iid: table.get(int(iid), "")
 
+    def __init__(self, instrument_map):
+        self._map = instrument_map
+
+    def resolve(self, instrument_id: int, on: date) -> Optional[str]:
+        try:
+            return self._map.resolve(int(instrument_id), on)
+        except (ValueError, KeyError):
+            return None
+
+    def observe(self, record) -> None:
+        """Feed a SymbolMappingMsg from the stream.
+
+        Metadata alone can be incomplete; the stream also carries mapping
+        messages, and DBNStore itself folds them in the same way.
+        """
+        try:
+            self._map.insert_symbol_mapping_msg(record)
+        except Exception:                    # noqa: BLE001
+            pass
+
+
+def build_symbology(store) -> InstrumentMapResolver:
+    """Build the resolver from the file's own symbology. No guessing."""
+    # Checked before the import: a file with no metadata is unusable
+    # whether or not the library is present, and reporting the missing
+    # dependency instead would send the reader down the wrong path.
     metadata = getattr(store, "metadata", None)
-    mappings = getattr(metadata, "mappings", None)
-    if mappings:
-        table = {}
-        for entry in mappings:
-            raw = getattr(entry, "raw_symbol", None) or getattr(entry, "symbol", None)
-            for interval in getattr(entry, "intervals", []) or []:
-                iid = getattr(interval, "instrument_id", None)
-                if iid is not None and raw:
-                    table[int(iid)] = str(raw)
-        if table:
-            return lambda iid: table.get(int(iid), "")
+    if metadata is None:
+        raise SymbologyError("this DBN file carries no metadata")
+    try:
+        from databento.common.symbology import InstrumentMap
+    except ImportError:  # pragma: no cover - operator environment only
+        raise SymbologyError(
+            "databento is not installed; run: pip install databento"
+        ) from None
+    instrument_map = InstrumentMap()
+    instrument_map.insert_metadata(metadata)
+    return InstrumentMapResolver(instrument_map)
 
-    symbols = list(getattr(metadata, "symbols", []) or [])
-    if len(symbols) == 1:
-        only = str(symbols[0])
-        return lambda iid: only
 
-    raise MarketDataError(
-        "cannot resolve instrument_id to a symbol from this file. Refusing "
-        "to guess: assigning one instrument to every record would pool "
-        "different contracts into a single series and silently corrupt "
-        "every level and excursion computed from it."
-    )
+def is_symbol_mapping(record) -> bool:
+    return type(record).__name__ == "SymbolMappingMsg"
 
 
 class DatabentoFileSource:
@@ -124,8 +154,8 @@ class DatabentoFileSource:
     local bytes. A study that re-downloaded its own inputs could not be
     reproduced, and would spend money each time it ran.
 
-    `instruments` maps symbol -> Instrument, because one file holds all
-    the symbols that were requested together.
+    `instruments` maps symbol -> Instrument, because one file holds every
+    symbol that was requested together, separated only by instrument_id.
     """
 
     def __init__(self, path, instruments: Mapping[str, Instrument],
@@ -158,17 +188,28 @@ class DatabentoFileSource:
         """
         if records is None or resolver is None:
             store = self._open_store()
+            resolver = build_symbology(store)
             records = iter(store)
-            resolver = build_symbol_resolver(store)
 
         out: Dict[str, List[Bar]] = {sym: [] for sym in self.instruments}
         unknown: Dict[str, int] = {}
+        unresolved = 0
         last_seen: Dict[str, datetime] = {}
+        total = 0
 
         for record in records:
+            if is_symbol_mapping(record):
+                resolver.observe(record)
+                continue
             if not hasattr(record, "ts_event") or not hasattr(record, "open"):
-                continue                      # metadata / symbol-mapping rows
-            symbol = resolver(getattr(record, "instrument_id", -1))
+                continue                      # other metadata rows
+            total += 1
+            observed_at = ns_to_datetime(record.ts_event)
+            symbol = resolver.resolve(getattr(record, "instrument_id", -1),
+                                      observed_at.date())
+            if symbol is None:
+                unresolved += 1
+                continue
             instrument = self.instruments.get(symbol)
             if instrument is None:
                 unknown[symbol] = unknown.get(symbol, 0) + 1
@@ -184,11 +225,17 @@ class DatabentoFileSource:
             last_seen[symbol] = bar.observed_at
             out[symbol].append(bar)
 
+        if unresolved:
+            raise SymbologyError(
+                f"{unresolved:,} of {total:,} records could not be resolved to "
+                f"a symbol. Failing closed rather than dropping them: a "
+                f"silently smaller sample is worse than no sample.")
         if unknown:
             raise MarketDataError(
                 f"records resolved to symbols not in this source: "
                 f"{dict(sorted(unknown.items()))}. Dropping them silently "
                 f"would change the sample without saying so.")
+        self.last_record_total = total
         return out
 
     def history(self, instrument: Instrument, schema: MarketDataSchema,

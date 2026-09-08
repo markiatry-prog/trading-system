@@ -213,7 +213,27 @@ def test_tampered_data_file_is_detected(tmp_path):
         STUDY.verify_manifest(tmp_path)
 
 
-# --- instrument separation (the pooling defect) ------------------------
+# --- symbology: instrument separation ---------------------------------
+#
+# The defect chain this pins:
+#   1st run: one instrument assigned to every record -> NQ, MNQ and ES
+#            pooled into one series at three price levels.
+#   2nd run: a resolver written against a GUESSED metadata shape
+#            (`entry.raw_symbol` / `entry.intervals[].instrument_id`)
+#            resolved nothing and failed closed.
+# The real API is databento's InstrumentMap, whose `resolve` is keyed on
+# (instrument_id, DATE) because a continuous symbol's instrument_id
+# changes at every roll.
+
+from datetime import date as _date  # noqa: E402
+
+from trading_system.sources.databento_source import (  # noqa: E402
+    DictResolver, InstrumentMapResolver, SymbologyError, build_symbology,
+    is_symbol_mapping)
+
+BASE_NS = 1757342400000000000          # 2025-09-08T14:40:00Z
+MIN_NS = 60_000_000_000
+
 
 class _Rec:
     def __init__(self, iid, ts, price):
@@ -223,93 +243,185 @@ class _Rec:
         self.volume = 10
 
 
-def _three_instrument_source():
+def _source(symbols=("NQ.c.0", "MNQ.c.0", "ES.c.0")):
     from trading_system.sources.databento_source import DatabentoFileSource
-    instruments = {
-        "NQ.c.0": Instrument(symbol="NQ.c.0", product="NQ", tick_size=Decimal("0.25")),
-        "MNQ.c.0": Instrument(symbol="MNQ.c.0", product="MNQ", tick_size=Decimal("0.25")),
-        "ES.c.0": Instrument(symbol="ES.c.0", product="ES", tick_size=Decimal("0.25")),
-    }
+    instruments = {s: Instrument(symbol=s, product=s.split(".")[0],
+                                 tick_size=Decimal("0.25")) for s in symbols}
     return DatabentoFileSource("f.dbn", instruments,
                                datetime(2026, 9, 8, tzinfo=timezone.utc))
 
 
-def test_records_are_split_by_their_real_instrument_not_the_caller_s():
-    """The defect this pins: one DBN file interleaves every requested
-    symbol, distinguished only by instrument_id. Assigning the caller's
-    instrument to every record pooled NQ, MNQ and ES into one series at
-    three different price levels."""
-    src = _three_instrument_source()
-    base = 1757342400000000000
+def test_interleaved_instrument_ids_land_in_the_correct_streams():
+    """Requirement 8: multiple interleaved IDs, each record in the right
+    stream. Prices differ by instrument so a pooled series would be
+    obvious -- but nothing here INFERS the symbol from price."""
+    src = _source()
     records = [
-        _Rec(1, base, 20000000000000),          # NQ  @ 20000
-        _Rec(2, base, 20000000000000),          # MNQ @ 20000
-        _Rec(3, base, 5600000000000),           # ES  @ 5600
-        _Rec(1, base + 60_000_000_000, 20001000000000),
-        _Rec(3, base + 60_000_000_000, 5601000000000),
+        _Rec(1, BASE_NS, 20000_000000000),            # NQ
+        _Rec(2, BASE_NS, 20000_000000000),            # MNQ, same price
+        _Rec(3, BASE_NS, 5600_000000000),             # ES
+        _Rec(3, BASE_NS + MIN_NS, 5601_000000000),
+        _Rec(1, BASE_NS + MIN_NS, 20001_000000000),
+        _Rec(2, BASE_NS + MIN_NS, 20001_000000000),
+        _Rec(1, BASE_NS + 2 * MIN_NS, 20002_000000000),
     ]
-    resolver = {1: "NQ.c.0", 2: "MNQ.c.0", 3: "ES.c.0"}.get
-    out = src.bars_by_symbol(records=records, resolver=lambda i: resolver(i, ""))
-    assert len(out["NQ.c.0"]) == 2
-    assert len(out["MNQ.c.0"]) == 1
-    assert len(out["ES.c.0"]) == 2
-    assert all(b.instrument.symbol == "NQ.c.0" for b in out["NQ.c.0"])
+    resolver = DictResolver({1: "NQ.c.0", 2: "MNQ.c.0", 3: "ES.c.0"})
+    out = src.bars_by_symbol(records=records, resolver=resolver)
+    assert [len(out[s]) for s in ("NQ.c.0", "MNQ.c.0", "ES.c.0")] == [3, 2, 2]
+    for symbol, bars in out.items():
+        assert all(b.instrument.symbol == symbol for b in bars)
     assert out["ES.c.0"][0].close == Decimal("5600")
+    assert out["NQ.c.0"][0].close == Decimal("20000")
+    # requirement 10, in miniature: nothing lost, nothing duplicated
+    assert sum(len(v) for v in out.values()) == len(records)
 
 
-def test_an_unrecognised_symbol_is_refused_not_dropped():
-    """Silently dropping records would change the sample without saying so."""
-    src = _three_instrument_source()
-    records = [_Rec(9, 1757342400000000000, 100000000000)]
+def test_the_same_instrument_id_can_map_to_different_symbols_over_time():
+    """A continuous symbol rolls: one instrument_id is NQ.c.0 for a while
+    and something else later. A flat dict is right until the first roll
+    and wrong afterwards, showing up as a price discontinuity rather
+    than an error."""
+    class RollingResolver:
+        def resolve(self, iid, on):
+            if int(iid) != 7:
+                return None
+            return "NQ.c.0" if on < _date(2025, 9, 9) else "MNQ.c.0"
+        def observe(self, record):
+            return None
+
+    src = _source()
+    day_two = BASE_NS + 24 * 60 * MIN_NS
+    out = src.bars_by_symbol(
+        records=[_Rec(7, BASE_NS, 20000_000000000),
+                 _Rec(7, day_two, 20050_000000000)],
+        resolver=RollingResolver())
+    assert len(out["NQ.c.0"]) == 1 and len(out["MNQ.c.0"]) == 1
+
+
+def test_unresolvable_ids_fail_closed_and_are_never_dropped():
+    """Requirements 6 and 7."""
+    src = _source()
+    records = [_Rec(1, BASE_NS, 20000_000000000),
+               _Rec(99, BASE_NS, 20000_000000000)]
+    with pytest.raises(SymbologyError, match="could not be resolved"):
+        src.bars_by_symbol(records=records,
+                           resolver=DictResolver({1: "NQ.c.0"}))
+
+
+def test_a_resolved_symbol_outside_the_requested_set_is_refused():
+    src = _source()
     with pytest.raises(MarketDataError, match="not in this source"):
-        src.bars_by_symbol(records=records, resolver=lambda i: "RTY.c.0")
+        src.bars_by_symbol(records=[_Rec(4, BASE_NS, 100_000000000)],
+                           resolver=DictResolver({4: "RTY.c.0"}))
 
 
 def test_backwards_time_within_one_symbol_is_refused():
-    src = _three_instrument_source()
-    base = 1757342400000000000
-    records = [_Rec(1, base + 60_000_000_000, 20001000000000),
-               _Rec(1, base, 20000000000000)]
+    src = _source()
     with pytest.raises(MarketDataError, match="backwards in time"):
-        src.bars_by_symbol(records=records, resolver=lambda i: "NQ.c.0")
+        src.bars_by_symbol(
+            records=[_Rec(1, BASE_NS + MIN_NS, 20001_000000000),
+                     _Rec(1, BASE_NS, 20000_000000000)],
+            resolver=DictResolver({1: "NQ.c.0"}))
 
 
-def test_interleaving_across_symbols_is_not_mistaken_for_backwards_time():
-    """Symbols are interleaved in the file; each series is ordered only
-    within itself. Checking order globally would reject a valid file."""
-    src = _three_instrument_source()
-    base = 1757342400000000000
-    records = [_Rec(1, base + 60_000_000_000, 20001000000000),
-               _Rec(3, base, 5600000000000)]
-    out = src.bars_by_symbol(records=records,
-                             resolver=lambda i: {1: "NQ.c.0", 3: "ES.c.0"}[i])
+def test_interleaving_is_not_mistaken_for_backwards_time():
+    """Order holds within each symbol; the file interleaves them."""
+    src = _source()
+    out = src.bars_by_symbol(
+        records=[_Rec(1, BASE_NS + MIN_NS, 20001_000000000),
+                 _Rec(3, BASE_NS, 5600_000000000)],
+        resolver=DictResolver({1: "NQ.c.0", 3: "ES.c.0"}))
     assert len(out["NQ.c.0"]) == 1 and len(out["ES.c.0"]) == 1
 
 
-def test_resolver_refuses_a_file_it_cannot_map():
-    from trading_system.sources.databento_source import build_symbol_resolver
+def test_symbol_mapping_messages_are_fed_to_the_resolver_not_parsed_as_bars():
+    class SymbolMappingMsg:                      # name is what is matched
+        instrument_id = 1
+    seen = []
 
-    class Meta:
-        mappings = []
-        symbols = ["NQ.c.0", "ES.c.0"]
+    class Recording(DictResolver):
+        def observe(self, record):
+            seen.append(record)
 
-    class Store:
-        symbology_map = {}
-        metadata = Meta()
+    src = _source()
+    out = src.bars_by_symbol(
+        records=[SymbolMappingMsg(), _Rec(1, BASE_NS, 20000_000000000)],
+        resolver=Recording({1: "NQ.c.0"}))
+    assert len(seen) == 1
+    assert len(out["NQ.c.0"]) == 1
 
-    with pytest.raises(MarketDataError, match="Refusing to guess"):
-        build_symbol_resolver(Store())
+
+def test_is_symbol_mapping_matches_by_type_name():
+    class SymbolMappingMsg:
+        pass
+    assert is_symbol_mapping(SymbolMappingMsg())
+    assert not is_symbol_mapping(_Rec(1, BASE_NS, 1))
 
 
-def test_resolver_accepts_a_single_symbol_file():
-    from trading_system.sources.databento_source import build_symbol_resolver
+def test_instrument_map_resolver_returns_none_rather_than_raising():
+    """A miss must be a clean None so the caller can fail closed with a
+    useful count, not an opaque exception from inside the vendor."""
+    class Raises:
+        def resolve(self, iid, on):
+            raise ValueError("no mapping")
+    assert InstrumentMapResolver(Raises()).resolve(1, _date(2025, 1, 1)) is None
 
-    class Meta:
-        mappings = []
-        symbols = ["NQ.c.0"]
 
-    class Store:
-        symbology_map = {}
-        metadata = Meta()
+def test_build_symbology_refuses_a_file_without_metadata():
+    class NoMeta:
+        metadata = None
+    with pytest.raises(SymbologyError, match="no metadata"):
+        build_symbology(NoMeta())
 
-    assert build_symbol_resolver(Store())(123) == "NQ.c.0"
+
+def test_no_instrument_id_is_hard_coded_anywhere():
+    """Requirement 3. Symbol identity comes from the file, never from a
+    literal in our source."""
+    import re
+    src = (ROOT / "trading_system" / "sources" / "databento_source.py").read_text()
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.strip().startswith("#"))
+    assert "instrument_id ==" not in code
+    assert not re.search(r"\{\s*\d+\s*:\s*[\"']", code), "an id->symbol literal"
+
+
+def test_symbols_are_never_inferred_from_price():
+    """Requirement 4."""
+    src = (ROOT / "trading_system" / "sources" / "databento_source.py").read_text()
+    for banned in ("if price", "close >", "close <", "price >", "price <"):
+        assert banned not in src, banned
+
+
+# --- real-file smoke test (requirements 9 and 10) ---------------------
+
+DATA = ROOT / "data" / "t004"
+
+
+@pytest.mark.skipif(not (DATA / "manifest.json").exists(),
+                    reason="acquired dataset not present in this environment")
+def test_real_file_resolves_into_exactly_the_three_continuous_symbols():
+    """Runs only where the acquired file exists. Skipped in CI, which
+    holds no market data by design."""
+    from trading_system.sources.databento_source import DatabentoFileSource
+    manifest = json.loads((DATA / "manifest.json").read_text())
+    instruments = {s: Instrument(symbol=s, product=s.split(".")[0],
+                                 tick_size=Decimal("0.25"))
+                   for s in ("NQ.c.0", "MNQ.c.0", "ES.c.0")}
+    src = DatabentoFileSource(DATA / manifest["file"], instruments,
+                              datetime.now(timezone.utc))
+    out = src.bars_by_symbol()
+
+    assert set(out) == {"NQ.c.0", "MNQ.c.0", "ES.c.0"}
+    for symbol, bars in out.items():
+        assert bars, f"{symbol} resolved to zero bars"
+        span_days = (bars[-1].observed_at - bars[0].observed_at).days or 1
+        sessions = max(1, span_days * 5 / 7)
+        per_session = len(bars) / sessions
+        assert per_session <= 1440, (
+            f"{symbol}: {per_session:,.0f} bars per session exceeds the "
+            f"1,440 minutes a day contains; instruments are pooled")
+        assert per_session > 100, f"{symbol}: only {per_session:,.0f} per session"
+    total = sum(len(v) for v in out.values())
+    assert total == src.last_record_total, (
+        f"{total:,} bars kept vs {src.last_record_total:,} records read; "
+        f"records were lost or duplicated")
