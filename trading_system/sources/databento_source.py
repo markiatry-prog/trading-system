@@ -45,8 +45,36 @@ def ns_to_datetime(ns: int) -> datetime:
         microsecond=remainder // 1000)
 
 
+def contract_id_for(instrument_id: int, dataset: str = DATASET) -> str:
+    """The deliverable contract that printed a record, named from the
+    file's own symbology.
+
+    WHY THE instrument_id AND NOT THE SYMBOL. The resolver maps
+    instrument_id -> the symbol we ASKED FOR ("NQ.c.0"), because that is
+    what `metadata.mappings` is keyed by. The continuous symbol is
+    therefore identical across every contract in the file and cannot
+    distinguish them. The instrument_id can: on GLBX.MDP3 it is CME's
+    own security id, assigned per listed contract and stable for that
+    contract's life, so it changes at a roll and only at a roll.
+
+    Namespaced by dataset because instrument ids are only unique within
+    one, and an unqualified integer would silently compare equal across
+    two datasets that mean different things by it.
+
+    NO CALENDAR, NO PRICE INFERENCE. Nothing here knows what an expiry
+    is. If the vendor ever reassigns ids without a roll, this reports
+    MORE boundaries than there were, never fewer -- it errs toward
+    refusing to certify continuity, which is the safe direction. The
+    count is cross-checked against the known expiry calendar in
+    `scripts/analyze_exclusions.py`; that check exists to falsify this
+    assumption, not to supply the answer.
+    """
+    return f"{dataset}:{int(instrument_id)}"
+
+
 def normalize_ohlcv(record, instrument: Instrument, captured_at: datetime,
-                    provider: str = "databento") -> Bar:
+                    provider: str = "databento",
+                    contract_id: Optional[str] = None) -> Bar:
     """One DBN OhlcvMsg -> one canonical Bar.
 
     `ts_event` on a Databento OHLCV record is the bar's OPEN time, which
@@ -54,6 +82,8 @@ def normalize_ohlcv(record, instrument: Instrument, captured_at: datetime,
     would shift every bar forward by its own interval and silently move
     every session boundary.
     """
+    if contract_id is None and hasattr(record, "instrument_id"):
+        contract_id = contract_id_for(record.instrument_id)
     return Bar(
         instrument=instrument,
         interval_seconds=BAR_SECONDS,
@@ -65,6 +95,7 @@ def normalize_ohlcv(record, instrument: Instrument, captured_at: datetime,
         observed_at=ns_to_datetime(record.ts_event),
         captured_at=captured_at,
         provider=provider,
+        contract_id=contract_id,
     )
 
 
@@ -205,8 +236,8 @@ class DatabentoFileSource:
                 continue                      # other metadata rows
             total += 1
             observed_at = ns_to_datetime(record.ts_event)
-            symbol = resolver.resolve(getattr(record, "instrument_id", -1),
-                                      observed_at.date())
+            instrument_id = getattr(record, "instrument_id", -1)
+            symbol = resolver.resolve(instrument_id, observed_at.date())
             if symbol is None:
                 unresolved += 1
                 continue
@@ -214,8 +245,13 @@ class DatabentoFileSource:
             if instrument is None:
                 unknown[symbol] = unknown.get(symbol, 0) + 1
                 continue
+            # The symbol says which SERIES this belongs to; the
+            # instrument_id says which CONTRACT printed it. Both are
+            # carried, because across a roll they disagree and the
+            # disagreement is the thing research must see.
             bar = normalize_ohlcv(record, instrument, self.captured_at,
-                                  self.provider)
+                                  self.provider,
+                                  contract_id=contract_id_for(instrument_id))
             previous = last_seen.get(symbol)
             if previous is not None and bar.observed_at < previous:
                 raise MarketDataError(

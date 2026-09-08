@@ -224,11 +224,37 @@ def main() -> int:
         print("    -> large divergence would mean the gate selects on volatility")
 
     # -- fixture -------------------------------------------------------
+    # Contract provenance, anonymised. The rule only ever asks whether
+    # two adjacent sessions carry the SAME contract, so a stable label
+    # in first-seen order preserves everything it needs while keeping
+    # the fixture free of anything but statistics. The real ids stay in
+    # the dataset.
+    contract_label = {}
+    def labels_for(d):
+        out = []
+        for b in by_day[d]:
+            cid = getattr(b, "contract_id", None)
+            if cid is None:
+                if None not in contract_label:
+                    contract_label[None] = "UNKNOWN"
+                lbl = "UNKNOWN"
+            else:
+                if cid not in contract_label:
+                    contract_label[cid] = f"C{len(contract_label)}"
+                lbl = contract_label[cid]
+            if lbl not in out:
+                out.append(lbl)
+        return sorted(out)
+
+    session_contracts = {d: labels_for(d) for d in days}
+
     fixture = {
         "symbol": args.symbol,
         "source_sha256": manifest["sha256"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "note": "anonymised per-session statistics; contains no prices",
+        "note": "anonymised per-session statistics; contains no prices. "
+                "`contracts` are stable labels in first-seen order, not "
+                "exchange ids: the rule only compares them for equality.",
         "sessions": [
             {
                 "date": d.isoformat(),
@@ -243,6 +269,7 @@ def main() -> int:
                 "old_gate_reasons": old_gate(by_day[d]),
                 "new_gate_exclusions": per_day[d].exclusions,
                 "new_gate_observations": per_day[d].observations,
+                "contracts": session_contracts[d],
             }
             for d in days
         ],

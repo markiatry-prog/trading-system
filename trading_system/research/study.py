@@ -19,6 +19,12 @@ CONDITIONING USES available_at, ALWAYS. A condition is evaluated from
 the most recent feature record KNOWABLE at the event, never the most
 recent one that had occurred. That difference is the whole lookahead
 question, and it is resolved in exactly one place: `condition_state`.
+
+ELIGIBILITY IS DECIDED BEFORE CONDITIONING, NOT AFTER. An observation
+that compares two different futures contracts is not a weak
+observation to be down-weighted; it is not an observation of the
+claim at all, so it is removed before anything is measured. See
+`research.eligibility`.
 """
 from __future__ import annotations
 
@@ -29,8 +35,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..market_data import Bar
 from ..provenance import digest, utcnow
+from ..features.contracts import ContractTimeline
 from ..features.records import FeatureRecord
 from .classify import Classification, classify
+from .eligibility import EligibilityReport, filter_eligible
 from .hypotheses import Direction, Hypothesis, HypothesisRegistry
 from .inference import Estimate, bootstrap_mean, two_sided_p
 from .multiplicity import SnoopingLedger, benjamini_hochberg
@@ -84,6 +92,10 @@ class HypothesisResult:
     mfe_mean: Optional[float] = None
     mae_mean: Optional[float] = None
     favorable_first_fraction: Optional[float] = None
+    # n_events counts events that SURVIVED eligibility. The refused ones
+    # are reported here rather than merely subtracted, so a shrunken
+    # sample always carries the reason it shrank.
+    eligibility: Optional[EligibilityReport] = None
 
     def as_row(self) -> dict:
         return {
@@ -93,6 +105,8 @@ class HypothesisResult:
             "p_value": None if self.p_value is None else round(self.p_value, 6),
             "mfe_mean": self.mfe_mean, "mae_mean": self.mae_mean,
             "favorable_first_fraction": self.favorable_first_fraction,
+            "eligibility": (self.eligibility.as_row()
+                            if self.eligibility else None),
         }
 
 
@@ -103,6 +117,11 @@ class Study:
     partitions: ChronologicalPartitions
     registry: HypothesisRegistry
     quality: QualityReport
+    # The contract provenance of every session in the sample. Optional
+    # in the type only: a study that omits it can establish no
+    # prior-session comparison as within-contract, so every such
+    # hypothesis reports zero eligible events and says why.
+    contracts: Optional[ContractTimeline] = None
     ledger: SnoopingLedger = field(default_factory=SnoopingLedger)
     results: List[HypothesisResult] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: utcnow().isoformat())
@@ -126,6 +145,11 @@ class Study:
         self.ledger.record(f"{hypothesis_id}@{partition.value}", exploratory)
 
         candidates = [e for e in events if e.type == h.event_type]
+        # The contract-boundary rule, applied before any measurement.
+        # Scoped to this hypothesis: a session refused here is still in
+        # the sample for every hypothesis that does not reach back
+        # across its boundary.
+        candidates, eligibility = filter_eligible(h, candidates, self.contracts)
         signed_returns: List[float] = []
         mfes: List[float] = []
         maes: List[float] = []
@@ -164,6 +188,7 @@ class Study:
             mae_mean=(sum(maes) / len(maes)) if maes else None,
             favorable_first_fraction=(
                 sum(1 for f in fav_first if f) / len(fav_first)) if fav_first else None,
+            eligibility=eligibility,
         )
         self.results.append(result)
         return result
@@ -209,6 +234,8 @@ class Study:
             "partitions": self.partitions.provenance(),
             "hypotheses": self.registry.provenance(),
             "data_quality": self.quality.summary(),
+            "contract_provenance": (self.contracts.summary()
+                                    if self.contracts else None),
             "multiplicity": self.ledger.summary(),
             "results": [r.as_row() for r in self.results],
         }

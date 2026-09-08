@@ -1,5 +1,19 @@
 """Quarterly roll and expiry, computed rather than tabulated.
 
+NOT THE ELIGIBILITY RULE. Research eligibility across a contract
+boundary is decided in `features.contracts`, from the vendor's
+symbology, and nothing in this module is consulted for it. This module
+explains WHY the expiry sessions look the way they do, and serves as a
+FALSIFIER: if the contract transitions read off the symbology do not
+track the quarterly cycle this computes, the instrument ids are not
+stable per contract and the eligibility rule is unsound. That check
+lives in `scripts/analyze_exclusions.py`.
+
+The distinction matters because a calendar rule is right about a
+typical year and wrong about every early, late, staggered or
+holiday-shifted roll -- which is precisely the case where a
+contaminated observation would slip through.
+
 Unlike holidays, this needs no data table and no coverage limit: CME
 equity-index futures expire on the THIRD FRIDAY of March, June,
 September and December, and that is a rule, not a list. It is therefore

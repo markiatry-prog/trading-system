@@ -5,6 +5,7 @@ Order is fixed and cannot be shuffled:
   1. verify the acquisition manifest       (integrity + provenance)
   2. normalise DBN -> canonical bars       (the vendor stops here)
   3. DATA-QUALITY GATE                     (before any statistic)
+  3b. contract provenance per session      (eligibility, not quality)
   4. chronological partitions              (holdout SEALED)
   5. load the frozen preregistered set     (already sealed in code)
   6. run discovery, then validation        (holdout untouched)
@@ -29,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trading_system.features.config import FeatureConfig
+from trading_system.features.contracts import ContractTimeline
 from trading_system.features.engine import FeatureEngine
 from trading_system.market_data import Instrument
 from trading_system.research.classify import Verdict
@@ -150,6 +152,23 @@ def main() -> int:
     if len(usable) < 30:
         raise SystemExit(f"only {len(usable)} usable days; refusing to compute")
 
+    # Built from the days that PASSED the gate, in the order the engine
+    # will see them: "prior session" must mean the session whose level
+    # actually gets carried forward, not the previous calendar day.
+    contracts = ContractTimeline.from_bars(
+        [b for day in usable for b in by_day[day]], calendar)
+    cp = contracts.summary()
+    print(f"\n3b. contract provenance (from symbology, not the calendar)")
+    print(f"   {cp['distinct_contracts']} distinct contracts across "
+          f"{cp['sessions']} sessions")
+    for verdict, n in sorted(cp["verdicts"].items(), key=lambda kv: -kv[1]):
+        print(f"     {n:>5}  {verdict}")
+    if cp["transitions"]:
+        print(f"   contract boundaries:")
+        for t in cp["transitions"]:
+            print(f"     {t['session_date']}  "
+                  f"{t['prior_contract_id']} -> {t['contract_id']}")
+
     parts = split_chronologically(usable)
     print(f"\n4. partitions")
     print(f"   discovery  {parts.discovery[0]} .. {parts.discovery[1]}")
@@ -160,7 +179,8 @@ def main() -> int:
     print(f"\n5. frozen hypothesis set: {registry.count()} hypotheses, "
           f"chain valid={registry.verify()}, sealed={registry.sealed}")
 
-    study = Study(f"t004-{args.symbol}", parts, registry, quality)
+    study = Study(f"t004-{args.symbol}", parts, registry, quality,
+                  contracts=contracts)
 
     stages = [Partition.DISCOVERY, Partition.VALIDATION]
     if args.unseal_holdout:
@@ -171,11 +191,23 @@ def main() -> int:
     print()
     for stage in stages:
         days = parts.select(usable, stage)
+        # ONE engine, fed the whole stage in order. A fresh engine per
+        # day never carries a prior-day level forward, so
+        # _detect_sweeps could not fire on any reference and H6/H7 had
+        # exactly zero events -- a silent floor, not an error. The
+        # engine is designed to consume a continuous stream; this feeds
+        # it one.
+        #
+        # A separate engine PER STAGE, not one across all of them,
+        # because a single engine would have to be fed the holdout's
+        # bars to reach the holdout's records. The cost is that the
+        # first day of each stage has no prior session, which the
+        # contract rule already reports as no_prior_session.
+        engine = FeatureEngine(instrument, config)
         events, features, stage_bars = [], [], []
         for day in days:
-            recs = FeatureEngine(instrument, config).run(by_day[day])
-            events.extend(r for r in recs if r.kind.value == "event")
-            features.extend(r for r in recs if r.kind.value == "feature")
+            for record in engine.run(by_day[day]):
+                (events if record.kind.value == "event" else features).append(record)
             stage_bars.extend(by_day[day])
         for h in registry.all():
             study.test(h.id, stage, events, features, stage_bars)

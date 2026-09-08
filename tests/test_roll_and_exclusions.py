@@ -211,3 +211,97 @@ def test_the_old_gate_would_still_reject_most_sessions():
                   if "max_single_bar_move_atr" in r["old_gate_reasons"]]
     assert len(ratio_rule) > 0.75 * len(old_failed), (
         "the range-ratio rule should account for most old exclusions")
+
+
+# --- exclusion attribution -------------------------------------------
+# The two 2025/2026 exclusions were reported as "unexplained" by the
+# first classifier, which had no branch for the integrity rules and so
+# reported "I have no branch for this" in the same word it uses for "no
+# cause exists". These tests remove that ambiguity permanently.
+
+def _analyzer():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "analyze_exclusions", ROOT / "scripts" / "analyze_exclusions.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_exclusion_rule_the_gate_can_fire_has_a_named_mechanism():
+    """The guard that makes 'unexplained' meaningful. Add a rule to the
+    gate without naming it here and this fails immediately, rather than
+    surfacing months later as a session nobody can account for."""
+    from trading_system.research.quality import ExclusionRule
+    named = set(_analyzer().RULE_MECHANISM)
+    assert {r.value for r in ExclusionRule} <= named, \
+        f"unnamed: {{r.value for r in ExclusionRule}} - {named}"
+
+
+def test_an_integrity_defect_is_named_as_one_not_left_unexplained():
+    m = _analyzer()
+    for rule in ("implausible_print", "duplicate_timestamps", "out_of_order",
+                 "degraded_source_date"):
+        family, why = m.mechanism(
+            date(2025, 7, 15),
+            {"new_gate_exclusions": [rule], "expected_rth_minutes": 390})
+        assert family == "data_integrity", f"{rule} -> {family}"
+        assert why and why != rule
+
+
+def test_an_expiry_session_is_named_as_an_expiry_not_a_feed_gap():
+    m = _analyzer()
+    family, _ = m.mechanism(
+        date(2025, 3, 21),
+        {"new_gate_exclusions": ["rth_coverage"], "expected_rth_minutes": 390})
+    assert family == "quarterly_expiry"
+
+
+def test_an_integrity_defect_on_an_expiry_day_is_still_reported_as_the_defect():
+    """Otherwise a real corruption hides behind the calendar."""
+    m = _analyzer()
+    family, _ = m.mechanism(
+        date(2025, 3, 21),
+        {"new_gate_exclusions": ["rth_coverage", "duplicate_timestamps"],
+         "expected_rth_minutes": 390})
+    assert family == "data_integrity"
+
+
+def test_only_a_rule_the_script_has_never_heard_of_is_unexplained():
+    m = _analyzer()
+    family, why = m.mechanism(
+        date(2025, 7, 15),
+        {"new_gate_exclusions": ["some_future_rule"],
+         "expected_rth_minutes": 390})
+    assert family == "unexplained"
+    assert "some_future_rule" in why
+
+
+def test_continuity_from_the_fixture_matches_the_engines_verdicts():
+    """The offline report and the live rule must not diverge."""
+    m = _analyzer()
+    by_day = {
+        date(2026, 1, 12): {"contracts": ["C0"]},
+        date(2026, 1, 13): {"contracts": ["C0"]},
+        date(2026, 1, 14): {"contracts": ["C1"]},
+        date(2026, 1, 15): {"contracts": ["C1", "C2"]},
+        date(2026, 1, 16): {"contracts": ["UNKNOWN"]},
+    }
+    assert m.continuity(date(2026, 1, 12), None, by_day) == "no_prior_session"
+    assert m.continuity(date(2026, 1, 13), date(2026, 1, 12), by_day) == "same_contract"
+    assert m.continuity(date(2026, 1, 14), date(2026, 1, 13), by_day) == "contract_boundary"
+    assert m.continuity(date(2026, 1, 15), date(2026, 1, 14), by_day) == "mixed_session"
+    assert m.continuity(date(2026, 1, 16), date(2026, 1, 15), by_day) == "unknown_provenance"
+
+
+def test_the_analyzer_treats_the_expiry_calendar_only_as_a_cross_check():
+    """It may compare against expiries; it may not decide eligibility
+    from them. Every continuity verdict must come from the labels."""
+    import ast
+    tree = ast.parse((ROOT / "scripts" / "analyze_exclusions.py").read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "continuity")
+    called = {n.func.id for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "is_quarterly_expiry" not in called
+    assert "expiries_between" not in called

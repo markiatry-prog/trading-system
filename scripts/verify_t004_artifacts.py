@@ -121,6 +121,31 @@ def main() -> int:
         f.check(ledger.get("total_tests_run") == expected_results,
                 "snooping ledger agrees with results",
                 f"ledger {ledger.get('total_tests_run')} vs {len(results)}")
+
+        # Contract-boundary eligibility. A report with no eligibility
+        # record came from the code path that had no rule, so its
+        # prior-session results cannot be distinguished from
+        # cross-contract artifacts and it must not read as valid.
+        cp = prov.get("contract_provenance")
+        f.check(cp is not None, "contract provenance recorded",
+                "absent: this report predates the contract-boundary rule"
+                if cp is None else
+                f"{cp.get('distinct_contracts')} contracts, "
+                f"{len(cp.get('transitions', []))} transitions")
+        rows = [r.get("eligibility") for r in results]
+        f.check(all(e is not None for e in rows),
+                "every result carries an eligibility record",
+                f"{sum(1 for e in rows if e is None)} of {len(rows)} missing")
+        applied = [e for e in rows if e and e.get("applies")]
+        f.check(bool(applied),
+                "the rule applied to the prior-session hypotheses",
+                f"{len(applied)} results scoped by "
+                f"{applied[0]['rule'] if applied else 'nothing'}")
+        blind = [e for e in applied
+                 if e.get("excluded_by_verdict", {}).get("unknown_provenance")]
+        f.check(not blind,
+                "no result was refused for missing provenance",
+                f"{len(blind)} results could not see a contract id at all")
         dq = prov.get("data_quality", {})
         if dq:
             print(f"        data quality: {dq.get('days_passed')}/"

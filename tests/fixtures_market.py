@@ -14,7 +14,7 @@ RTH_OPEN = datetime(2026, 1, 12, 14, 30, tzinfo=timezone.utc)
 
 
 def bar(minute_offset, o, h, l, c, volume=100, instrument=NQ,
-        origin=RTH_OPEN, interval=60):
+        origin=RTH_OPEN, interval=60, contract_id=None):
     t = origin + timedelta(minutes=minute_offset)
     return Bar(
         instrument=instrument,
@@ -25,6 +25,7 @@ def bar(minute_offset, o, h, l, c, volume=100, instrument=NQ,
         observed_at=t,
         captured_at=t + timedelta(milliseconds=50),
         provider="fixture",
+        contract_id=contract_id,
     )
 
 

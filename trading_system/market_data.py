@@ -196,6 +196,27 @@ class Bar:
     `interval_seconds` rather than an enum of blessed intervals: 1s, 1m
     and 5m are all just numbers, and ORB in particular wants an opening
     range that is not necessarily a standard bar width.
+
+    `contract_id` NAMES THE DELIVERABLE CONTRACT THAT PRINTED THIS BAR,
+    which is NOT always what `instrument.symbol` says. A continuous
+    symbol such as NQ.c.0 is not a contract at all: it is whichever
+    contract is front month that day, so a series carrying one symbol
+    spans several contracts and steps to a different price level at
+    every quarterly roll. Research that reaches across a session
+    boundary -- a prior-day high, an overnight low -- is comparing two
+    numbers that may belong to two different contracts, and the
+    difference between them is carry, not market structure.
+
+    Adapters set this from the provider's own symbology; they must
+    never infer it from a calendar or from the price level. `None`
+    means the provider did not tell us, which is a different statement
+    from "one contract throughout" and is treated as such: the
+    contract-continuity rule refuses to certify what it cannot see.
+
+    It is deliberately NOT part of `records_digest`. The digest exists
+    so the same market window from two vendors hashes identically, and
+    one vendor resolving contracts while another does not is a
+    difference in provenance, not in the data.
     """
     instrument: Instrument
     interval_seconds: int
@@ -208,6 +229,7 @@ class Bar:
     captured_at: datetime
     trade_count: Optional[int] = None
     provider: str = "unknown"
+    contract_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         _check_times(self.observed_at, self.captured_at, "Bar")
