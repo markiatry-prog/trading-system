@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -227,9 +228,19 @@ def main() -> int:
     if args.out:
         report = {"manifest": manifest, "provenance": study.provenance(),
                   "verdicts": {k: v.as_row() for k, v in verdicts.items()}}
-        Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True,
-                                             default=str))
-        print(f"\nfull report written to {args.out}")
+        # ATOMIC. A crash or power loss mid-write must leave either the
+        # previous file or a complete new one -- never a truncated one
+        # that parses far enough to look finished. This exact ambiguity
+        # cost a session after an unexpected shutdown.
+        out_path = Path(args.out)
+        tmp = out_path.with_suffix(out_path.suffix + ".partial")
+        payload = json.dumps(report, indent=2, sort_keys=True, default=str)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())      # durable before the rename
+        os.replace(tmp, out_path)          # atomic on Windows and POSIX
+        print(f"\nfull report written to {args.out} ({len(payload):,} bytes)")
     return 0
 
 
