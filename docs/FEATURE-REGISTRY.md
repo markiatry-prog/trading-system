@@ -33,10 +33,10 @@ Types with a non-zero confirmation lag are marked **delayed** below.
 | `vwap` |  | RTH-only, volume-weighted typical price |
 | `session_high` |  |  |
 | `session_low` |  |  |
-| `prior_day_high` |  | previous completed RTH session |
-| `prior_day_low` |  | previous completed RTH session |
-| `overnight_high` |  | previous overnight window |
-| `overnight_low` |  | previous overnight window |
+| `prior_day_high` |  | **prior-session** — previous completed RTH session |
+| `prior_day_low` |  | **prior-session** — previous completed RTH session |
+| `overnight_high` |  | **prior-session** — previous overnight window |
+| `overnight_low` |  | **prior-session** — previous overnight window |
 | `opening_range_high` |  | available only once the range is established |
 | `opening_range_low` |  | available only once the range is established |
 | `atr` |  | configurable period; None until the window fills |
@@ -46,14 +46,36 @@ Types with a non-zero confirmation lag are marked **delayed** below.
 | `distance_to_vwap` |  |  |
 | `distance_to_opening_range_high` |  |  |
 | `distance_to_opening_range_low` |  |  |
-| `distance_to_prior_day_high` |  |  |
-| `distance_to_prior_day_low` |  |  |
-| `distance_to_overnight_high` |  |  |
-| `distance_to_overnight_low` |  |  |
+| `distance_to_prior_day_high` |  | **prior-session** |
+| `distance_to_prior_day_low` |  | **prior-session** |
+| `distance_to_overnight_high` |  | **prior-session** |
+| `distance_to_overnight_low` |  | **prior-session** |
 | `above_vwap` |  | state: above / below |
 | `swing_high` | **delayed** | pivot; confirmed k bars later |
 | `swing_low` | **delayed** | pivot; confirmed k bars later |
 | `minutes_since_rth_open` |  | negative before the open; time-of-day studies |
+
+### Prior-session primitives, and why they are marked
+
+The primitives marked **prior-session** are the only ones that read
+across a session boundary. Everything else is computed from the current
+session's tape alone.
+
+That distinction is not cosmetic. On a continuous series such as
+`NQ.c.0` the underlying contract changes at each quarterly roll, so a
+level carried into the next session may belong to a contract trading at
+a different price, and the gap between them is carry rather than
+anything the market did. `trading_system.features.contracts` therefore
+refuses to certify a prior-session comparison unless both sessions
+resolve to the same contract in the vendor's symbology, and
+`trading_system.research.eligibility` scopes that refusal to exactly the
+hypotheses that read one of these primitives -- the session itself stays
+in the sample for everything else.
+
+The two lists in `features/contracts.py` are derived from this table and
+guarded by a test against `FeatureEngine._roll_session`. A primitive
+added here that survives a session roll must be added there too, or the
+test fails.
 
 ## Events
 
@@ -64,8 +86,8 @@ Types with a non-zero confirmation lag are marked **delayed** below.
 | `opening_range_low_broken` |  | fires once per session |
 | `structure_break_up` |  | close beyond the last confirmed swing high |
 | `structure_break_down` |  | close beyond the last confirmed swing low |
-| `liquidity_sweep_high` |  | wick through the level AND close back inside |
-| `liquidity_sweep_low` |  | wick through the level AND close back inside |
+| `liquidity_sweep_high` |  | **prior-session** — wick through the level AND close back inside |
+| `liquidity_sweep_low` |  | **prior-session** — wick through the level AND close back inside |
 | `displacement_up` |  | true range >= configured ATR multiple |
 | `displacement_down` |  | true range >= configured ATR multiple |
 | `fvg_formed_up` | **delayed** | three-bar imbalance; effective at the middle bar |
