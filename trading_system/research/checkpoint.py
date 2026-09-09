@@ -13,21 +13,17 @@ completely ordinary. So the checkpoint carries a KEY digesting every
 input that determines the output, and a mismatch is refused rather than
 reconciled:
 
-  the dataset            sha256, byte count, acquisition request digest
-  the symbol             a study of ES cannot resume a study of NQ
-  the engine             version and config digest
-  the hypotheses         their STRUCTURE (see below)
-  the quality gate       thresholds, and the exact days that passed it
-  the partitions         the exact day list of each stage
-  the code               a digest over every module that computes a number
+That key is the study's SEMANTIC IDENTITY, defined once in
+`research.identity` and shared with the report so both answer "is this
+the same research design?" the same way: the dataset, the symbol, the
+engine and config versions, the hypotheses' structure, the outcome
+specification, the eligibility rules, the quality gate's thresholds and
+verdict, the partitions, and a digest over every module that computes a
+number.
 
-THE REGISTRY IS KEYED BY STRUCTURE, NOT BY ITS CHAIN HASH. Each
-hypothesis records `registered_at` from the wall clock at import, so
-the chain hashes differ between two processes running identical code.
-Keying on them would make every checkpoint stale immediately. The key
-therefore digests what a hypothesis SAYS -- id, statement, event type,
-direction, horizon, conditions, falsifier, and their order -- which
-changes if and only if the frozen set changes.
+It is stable across processes, which the wall-clock-stamped hypothesis
+chain is not -- see `research.identity` for why the chain stays as it is
+and this sits beside it rather than replacing it.
 
 THE HOLDOUT IS NEVER IN A CHECKPOINT. Not as a policy but as a
 mechanism: saving a holdout stage raises, and loading a file that
@@ -51,7 +47,7 @@ from typing import Dict, List, Optional, Sequence
 
 from ..provenance import digest, utcnow
 from .eligibility import EligibilityReport
-from .hypotheses import HypothesisRegistry
+from .identity import ResearchIdentity
 from .inference import Estimate
 from .multiplicity import SnoopingLedger
 from .partitions import Partition
@@ -59,89 +55,46 @@ from .study import HypothesisResult, Study
 
 CHECKPOINT_VERSION = "1.0.0"
 
-# Every module whose source can change a number in the report. A change
-# to any of them invalidates a checkpoint written before it.
-COMPUTING_MODULES = (
-    "features/calendar.py", "features/config.py", "features/contracts.py",
-    "features/engine.py", "features/records.py", "features/roll.py",
-    "market_data.py",
-    "research/classify.py", "research/eligibility.py",
-    "research/hypotheses.py", "research/inference.py",
-    "research/multiplicity.py", "research/outcomes.py",
-    "research/partitions.py", "research/preregistered.py",
-    "research/quality.py", "research/study.py",
-    "sources/databento_source.py",
-)
-
 
 class CheckpointError(Exception):
     """A checkpoint that cannot be trusted. Always fatal, never repaired."""
 
 
-def code_digest(package_root: Optional[Path] = None) -> str:
-    """A digest over the source of everything that computes a number."""
-    root = package_root or Path(__file__).resolve().parents[1]
-    parts = []
-    for rel in COMPUTING_MODULES:
-        path = root / rel
-        if not path.exists():
-            raise CheckpointError(
-                f"{rel} is missing; refusing to compute a code digest that "
-                f"would silently exclude it")
-        parts.append([rel, hashlib.sha256(path.read_bytes()).hexdigest()])
-    return digest(parts)
-
-
-def registry_structure_digest(registry: HypothesisRegistry) -> str:
-    """What the hypotheses SAY, in order. Independent of the wall clock."""
-    body = [
-        [h.id, h.statement, h.event_type, h.direction.value,
-         h.horizon_minutes, sorted(h.conditions.items()), h.falsifier]
-        for h in registry.all()
-    ]
-    return digest(body)
-
-
-def quality_digest(thresholds, passed_days: Sequence[date]) -> str:
-    """The gate's settings AND its verdict.
-
-    Both, deliberately. A threshold change that happens not to move any
-    day is harmless; a day list that moved without a threshold change
-    means the data or the calendar did, and that is not.
-    """
-    fields = {k: str(v) for k, v in sorted(asdict(thresholds).items())}
-    return digest([fields, [d.isoformat() for d in sorted(passed_days)]])
-
-
-def partition_digest(partitions) -> str:
-    prov = partitions.provenance()
-    return digest({k: v for k, v in sorted(prov.items())
-                   if k not in ("unseals", "holdout_ever_unsealed")})
-
-
 @dataclass(frozen=True)
 class CheckpointKey:
-    """Everything that determines the study's output."""
+    """The format version, plus the research design's semantic identity.
+
+    Everything that determines the OUTPUT lives in `identity`, which is
+    stable across processes by construction. `checkpoint_version` is the
+    one thing here that is about the file rather than the science: a
+    format change invalidates the file without the design having moved.
+    """
     checkpoint_version: str
-    study_version: str
-    engine_version: str
-    symbol: str
-    dataset_sha256: str
-    dataset_bytes: int
-    request_digest: str
-    config_digest: str
-    config_name: str
-    registry_structure: str
-    quality: str
-    partitions: str
-    code: str
+    identity: ResearchIdentity
+
+    @classmethod
+    def for_identity(cls, identity: ResearchIdentity) -> "CheckpointKey":
+        return cls(checkpoint_version=CHECKPOINT_VERSION, identity=identity)
 
     def digest(self) -> str:
-        return digest(dict(sorted(asdict(self).items())))
+        return digest({"checkpoint_version": self.checkpoint_version,
+                       "identity": self.identity.digest()})
 
     def differences(self, other: "CheckpointKey") -> List[str]:
-        mine, theirs = asdict(self), asdict(other)
-        return [k for k in sorted(mine) if mine[k] != theirs[k]]
+        out = [] if self.checkpoint_version == other.checkpoint_version \
+            else ["checkpoint_version"]
+        return out + self.identity.differences(other.identity)
+
+    def as_json(self) -> dict:
+        return {"checkpoint_version": self.checkpoint_version,
+                "identity": self.identity.as_row()}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "CheckpointKey":
+        fields = {k: v for k, v in data["identity"].items()
+                  if k != "semantic_digest"}
+        return cls(checkpoint_version=data["checkpoint_version"],
+                   identity=ResearchIdentity(**fields))
 
 
 def _estimate_to_json(e: Optional[Estimate]) -> Optional[dict]:
@@ -257,7 +210,7 @@ class StudyCheckpoint:
     def _body(self) -> dict:
         return {
             "checkpoint_version": CHECKPOINT_VERSION,
-            "key": dict(sorted(asdict(self.key).items())),
+            "key": self.key.as_json(),
             "key_digest": self.key.digest(),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -310,7 +263,7 @@ class StudyCheckpoint:
                 "this checkpoint contains holdout results, which this code "
                 "never writes. Refusing it outright.")
 
-        key = CheckpointKey(**data["key"])
+        key = CheckpointKey.from_json(data["key"])
         if key.digest() != data.get("key_digest"):
             raise CheckpointError("the stored key does not match its digest")
         if key != expected:

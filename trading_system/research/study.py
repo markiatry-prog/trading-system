@@ -40,6 +40,7 @@ from ..features.contracts import ContractTimeline
 from ..features.records import FeatureRecord
 from .classify import Classification, classify
 from .eligibility import EligibilityReport, filter_eligible
+from .identity import ResearchIdentity, registry_structure_digest
 from .hypotheses import Direction, Hypothesis, HypothesisRegistry
 from .inference import Estimate, bootstrap_mean, two_sided_p
 from .multiplicity import SnoopingLedger, benjamini_hochberg
@@ -227,6 +228,10 @@ class Study:
     # written the same way would compare the fast path against itself.
     # Both happened before this flag did.
     accelerate: bool = True
+    # The design's semantic identity, when the caller has built one.
+    # Reported alongside the results so a report states which research
+    # design produced it, in a form another process can compare against.
+    identity: Optional[ResearchIdentity] = None
     ledger: SnoopingLedger = field(default_factory=SnoopingLedger)
     results: List[HypothesisResult] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: utcnow().isoformat())
@@ -366,6 +371,8 @@ class Study:
             "partitions": self.partitions.provenance(),
             "hypotheses": self.registry.provenance(),
             "data_quality": self.quality.summary(),
+            "research_identity": (self.identity.as_row()
+                                  if self.identity else None),
             "contract_provenance": (self.contracts.summary()
                                     if self.contracts else None),
             "multiplicity": self.ledger.summary(),
@@ -373,13 +380,36 @@ class Study:
         }
 
     def reproducibility_digest(self) -> str:
-        """Same inputs, same code, same digest.
+        """Same inputs, same code, same digest -- ACROSS PROCESSES.
 
-        Excludes wall-clock fields, which differ between runs without any
-        difference in the science.
+        It did not used to be. `provenance()["hypotheses"]` carries each
+        entry's chain hash, and those are computed over `registered_at`,
+        which comes from the wall clock when `preregistered.py` is
+        imported. Two processes running byte-identical code on
+        byte-identical data therefore produced different digests, so the
+        one comparison this exists to support -- "is this the same study
+        I ran before?" -- always answered no.
+
+        The chain is not the thing to change: it is the audit record
+        proving no hypothesis was inserted or edited after registration,
+        and rewriting it to drop the timestamps would destroy that
+        evidence. So the chain is reported in full by `provenance()` and
+        summarised here by its STRUCTURE instead: what the hypotheses
+        say and in what order, which changes if and only if the frozen
+        set changes.
+
+        Wall-clock fields are excluded for the same reason they always
+        were: they differ between runs without any difference in the
+        science.
         """
         p = self.provenance()
         p["started_at"] = "<excluded>"
-        p["hypotheses"] = {k: v for k, v in p["hypotheses"].items() if k != "head"}
-        p["multiplicity"] = p["multiplicity"]
+        hypotheses = p["hypotheses"]
+        p["hypotheses"] = {
+            "count": hypotheses.get("count"),
+            "sealed": hypotheses.get("sealed"),
+            "chain_valid": hypotheses.get("chain_valid"),
+            # Structure, not the timestamp-bearing chain hashes.
+            "structure": registry_structure_digest(self.registry),
+        }
         return digest(p)

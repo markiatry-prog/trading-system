@@ -23,8 +23,10 @@ from trading_system.features.contracts import ContractTimeline
 from trading_system.features.engine import ENGINE_VERSION, FeatureEngine
 from trading_system.provenance import digest
 from trading_system.research.checkpoint import (
-    CHECKPOINT_VERSION, CheckpointError, CheckpointKey, StudyCheckpoint,
-    code_digest, partition_digest, quality_digest, registry_structure_digest)
+    CHECKPOINT_VERSION, CheckpointError, CheckpointKey, StudyCheckpoint)
+from trading_system.research.identity import (
+    IdentityError, ResearchIdentity, code_digest, partition_digest,
+    quality_digest, registry_structure_digest)
 from trading_system.research.partitions import (HoldoutSealed, Partition,
                                                 split_chronologically)
 from trading_system.research.preregistered import build_registry
@@ -50,20 +52,21 @@ def workload():
     return days, bars, events, features, day_list
 
 
-def make_key(day_list, **overrides) -> CheckpointKey:
-    base = dict(
-        checkpoint_version=CHECKPOINT_VERSION, study_version="1.0.0",
-        engine_version=ENGINE_VERSION, symbol="NQ.c.0",
+def make_identity(day_list, **overrides) -> ResearchIdentity:
+    base = ResearchIdentity.build(
+        study_version="1.0.0", engine_version=ENGINE_VERSION,
+        symbol="NQ.c.0", feature_config=FeatureConfig(),
+        registry=build_registry(), thresholds=QualityThresholds(),
+        passed_days=day_list, partitions=split_chronologically(day_list),
         dataset_sha256="9127a8bf" * 8, dataset_bytes=83_318_033,
-        request_digest="req-digest", config_digest=FeatureConfig().digest(),
-        config_name=FeatureConfig().name,
-        registry_structure=registry_structure_digest(build_registry()),
-        quality=quality_digest(QualityThresholds(), day_list),
-        partitions=partition_digest(split_chronologically(day_list)),
-        code=code_digest(),
-    )
-    base.update(overrides)
-    return CheckpointKey(**base)
+        request_digest="req-digest")
+    return replace(base, **overrides) if overrides else base
+
+
+def make_key(day_list, checkpoint_version=CHECKPOINT_VERSION,
+             **overrides) -> CheckpointKey:
+    return CheckpointKey(checkpoint_version=checkpoint_version,
+                         identity=make_identity(day_list, **overrides))
 
 
 def _fresh_study(bars, day_list):
@@ -184,7 +187,7 @@ def test_a_forged_key_cannot_be_smuggled_past_its_own_digest(tmp_path):
     StudyCheckpoint(key=key).save(path)
 
     data = json.loads(path.read_text())
-    data["key"]["dataset_sha256"] = "0" * 64
+    data["key"]["identity"]["dataset"] = "0" * 64
     data.pop("body_digest")
     data["body_digest"] = digest(data)      # recompute the outer digest
     path.write_text(json.dumps(data, indent=1, sort_keys=True))
@@ -195,16 +198,19 @@ def test_a_forged_key_cannot_be_smuggled_past_its_own_digest(tmp_path):
 # --- 3. staleness ------------------------------------------------------
 
 @pytest.mark.parametrize("field,value", [
-    ("dataset_sha256", "f" * 64),
-    ("dataset_bytes", 83_318_034),
-    ("request_digest", "a-different-acquisition"),
+    ("dataset", "a-different-dataset"),
     ("symbol", "ES.c.0"),
     ("engine_version", "9.9.9"),
-    ("config_digest", "a-different-config"),
-    ("registry_structure", "a-different-hypothesis-set"),
-    ("quality", "a-different-gate"),
+    ("study_version", "9.9.9"),
+    ("feature_config", "a-different-config"),
+    ("feature_config_name", "a-different-config-name"),
+    ("hypotheses", "a-different-hypothesis-set"),
+    ("outcome_spec", "a-different-outcome-rule"),
+    ("eligibility", "a-different-eligibility-rule"),
+    ("quality_gate", "a-different-gate"),
     ("partitions", "a-different-split"),
     ("code", "a-different-build"),
+    ("semantic_version", "0.0.1"),
     ("checkpoint_version", "0.0.1"),
 ])
 def test_any_change_to_an_input_refuses_the_checkpoint(tmp_path, field, value):
@@ -222,8 +228,8 @@ def test_any_change_to_an_input_refuses_the_checkpoint(tmp_path, field, value):
 def test_the_key_names_exactly_what_changed(tmp_path):
     day_list = [date(2021, 9, 7) + timedelta(days=i) for i in range(6)]
     a = make_key(day_list)
-    b = make_key(day_list, dataset_sha256="f" * 64, symbol="ES.c.0")
-    assert a.differences(b) == ["dataset_sha256", "symbol"]
+    b = make_key(day_list, dataset="a-different-dataset", symbol="ES.c.0")
+    assert a.differences(b) == ["dataset", "symbol"]
 
 
 def test_a_quality_gate_that_passes_different_days_is_a_different_key():
@@ -256,7 +262,7 @@ def test_editing_a_hypothesis_changes_the_registry_digest():
 
 
 def test_the_code_digest_covers_every_module_that_computes(tmp_path):
-    from trading_system.research.checkpoint import COMPUTING_MODULES
+    from trading_system.research.identity import COMPUTING_MODULES
     root = Path(__file__).resolve().parents[1] / "trading_system"
     for rel in COMPUTING_MODULES:
         assert (root / rel).exists(), rel
@@ -269,7 +275,7 @@ def test_the_code_digest_covers_every_module_that_computes(tmp_path):
 
 def test_a_missing_module_fails_closed_rather_than_hashing_less(tmp_path):
     (tmp_path / "features").mkdir()
-    with pytest.raises(CheckpointError, match="missing"):
+    with pytest.raises(IdentityError, match="missing"):
         code_digest(tmp_path)
 
 

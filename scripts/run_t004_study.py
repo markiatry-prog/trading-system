@@ -58,9 +58,8 @@ from trading_system.features.contracts import ContractTimeline
 from trading_system.features.engine import ENGINE_VERSION, FeatureEngine
 from trading_system.market_data import Instrument
 from trading_system.research.checkpoint import (
-    CHECKPOINT_VERSION, CheckpointError, CheckpointKey, StudyCheckpoint,
-    code_digest, partition_digest, quality_digest,
-    registry_structure_digest)
+    CheckpointError, CheckpointKey, StudyCheckpoint)
+from trading_system.research.identity import ResearchIdentity
 from trading_system.research.classify import Verdict
 from trading_system.research.outcomes import BarWindowIndex
 from trading_system.research.partitions import Partition, split_chronologically
@@ -255,27 +254,29 @@ def main() -> int:
     # -- checkpoint --------------------------------------------------
     # The key digests everything that determines the output. Resuming
     # under anything else is refused, not reconciled.
-    key = CheckpointKey(
-        checkpoint_version=CHECKPOINT_VERSION,
+    identity = ResearchIdentity.build(
         study_version=study.provenance()["study_version"],
         engine_version=ENGINE_VERSION,
         symbol=args.symbol,
+        feature_config=config,
+        registry=registry,
+        thresholds=QualityThresholds(),
+        passed_days=usable,
+        partitions=parts,
         dataset_sha256=manifest["sha256"],
         dataset_bytes=int(manifest["bytes"]),
         request_digest=str(manifest.get("request_digest", "")),
-        config_digest=config.digest(),
-        config_name=config.name,
-        registry_structure=registry_structure_digest(registry),
-        quality=quality_digest(QualityThresholds(), usable),
-        partitions=partition_digest(parts),
-        code=code_digest(),
     )
+    study.identity = identity
+    key = CheckpointKey.for_identity(identity)
     ckpt_path = Path(args.checkpoint or (
         (args.out + ".checkpoint.json") if args.out
         else f"t004-{args.symbol}.checkpoint.json"))
     checkpoint = load_or_start(ckpt_path, key, args.restart)
 
-    print(f"\n5b. checkpoint {ckpt_path}")
+    print(f"\n5b. research identity (stable across processes)")
+    print(f"    semantic digest {identity.digest()}")
+    print(f"    checkpoint {ckpt_path}")
     print(f"    key {key.digest()[:32]}")
     if checkpoint.completed():
         print(f"    RESUMING -- already complete: "
@@ -398,6 +399,7 @@ def main() -> int:
 
     if args.out:
         report = {"manifest": manifest, "provenance": study.provenance(),
+                  "research_identity": identity.as_row(),
                   "verdicts": {k: v.as_row() for k, v in verdicts.items()}}
         # ATOMIC. A crash or power loss mid-write must leave either the
         # previous file or a complete new one -- never a truncated one
