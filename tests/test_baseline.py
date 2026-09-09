@@ -666,3 +666,23 @@ def test_the_clustered_bootstrap_is_deterministic():
     pool = arms.build_control_pool({e.available_at for e in records})
     ct = measure_anchors(pool.anchors(), bars, Direction.UP, HORIZON, SPEC, index)
     assert cluster_bootstrap(ev, ct, SPEC) == cluster_bootstrap(ev, ct, SPEC)
+
+
+def test_the_event_arm_session_count_is_reported_separately():
+    """`unique_sessions` is the resampling universe and is the same for
+    every hypothesis, because the control pool spans every eligible
+    session. The count that answers "how many sessions support THIS
+    estimate" is the event arm's, and conflating them made every row of
+    the real report read 617."""
+    bars, events = clustered_market()
+    result, _ = run_comparison(bars, events)
+    assert result.event_sessions > 0
+    assert result.event_sessions <= result.unique_sessions
+    assert "event_sessions" in result.as_row()
+
+    # Events confined to a few sessions must not report the universe.
+    few, _ = run_comparison(*clustered_market(
+        n_sessions=30, hot_sessions=3, events_per_hot=40, events_per_cold=0))
+    assert few.event_sessions <= 5, (
+        f"{few.event_sessions} event sessions for events drawn from three")
+    assert few.event_sessions < few.unique_sessions

@@ -272,7 +272,15 @@ class BaselineComparison:
     lift_ci_high: Optional[float] = None
     lift_p_value: Optional[float] = None
     inference_unit: str = "session_cluster"
+    # Sessions in the RESAMPLING UNIVERSE: either arm. The control pool
+    # spans every eligible session, so this is the same for every
+    # hypothesis and says nothing about the evidence for any one of them.
     unique_sessions: int = 0
+    # Sessions the EVENT arm actually occupies. This is the count that
+    # answers "how many sessions support this estimate": a hypothesis
+    # firing 126,000 times across 588 sessions has 588 chances to be
+    # wrong, not 126,000.
+    event_sessions: int = 0
     effective_clusters: Optional[float] = None
     # The event-level figures, kept only so the difference is visible.
     # They treat every event as an independent draw, which events inside
@@ -323,6 +331,7 @@ class BaselineComparison:
             "lift_p_value": self.lift_p_value,
             "inference_unit": self.inference_unit,
             "unique_sessions": self.unique_sessions,
+            "event_sessions": self.event_sessions,
             "effective_clusters": self.effective_clusters,
             "event_level_ci_low": self.event_level_ci_low,
             "event_level_ci_high": self.event_level_ci_high,
@@ -470,6 +479,7 @@ def compare_to_baseline(hypothesis: Hypothesis, partition: str,
                                                matched_controls, spec)
     result.lift_ci_low, result.lift_ci_high, result.lift_p_value = low, high, p
     result.unique_sessions = sessions
+    result.event_sessions = len({o.session_date for o in matched_events})
     result.effective_clusters = effective_clusters(matched_events)
     if low is None:
         result.note = (

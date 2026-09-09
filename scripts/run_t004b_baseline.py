@@ -36,8 +36,10 @@ WHAT A RESULT MEANS
                 direction was right
   lift CI       percentile bootstrap resampling SESSIONS as clusters
   lift p        two-sided, from that same clustered distribution
-  eff           effective cluster count. Far below the event count means
-                a few sessions carry the result
+  ev_sess       sessions the EVENT arm occupies -- how many independent
+                chances the claim had to be wrong
+  eff           effective cluster count. Far below ev_sess means a few
+                of those sessions carry the result
   absolute      the T-004 quantity, reported alongside so the two can
                 be compared directly
 
@@ -344,7 +346,7 @@ def main() -> int:
     print("   Inference resamples SESSIONS as clusters. Events inside one")
     print("   session share a regime and overlapping forward windows, so")
     print("   they are not independent observations.\n")
-    header = (f"   {'id':4} {'n_ev':>6} {'sess':>5} {'eff':>6} {'n_ctl':>6} "
+    header = (f"   {'id':4} {'n_ev':>7} {'ev_sess':>7} {'eff':>6} {'n_ctl':>6} "
               f"{'absolute':>9} {'baseline':>9} {'lift':>8} "
               f"{'95% CI (clustered)':>22} {'p':>6}")
     print(header)
@@ -354,13 +356,13 @@ def main() -> int:
         eff = row.get("effective_clusters")
         eff_s = f"{eff:>6.1f}" if eff is not None else "     -"
         if row["lift"] is None or row["lift_ci_low"] is None:
-            print(f"   {row['hypothesis_id']:4} {ev['n']:>6} "
-                  f"{row.get('unique_sessions', 0):>5} {eff_s} {ct['n']:>6}"
+            print(f"   {row['hypothesis_id']:4} {ev['n']:>7} "
+                  f"{row.get('event_sessions', 0):>7} {eff_s} {ct['n']:>6}"
                   f"   {row['note'][:56]}")
             continue
         ci = f"[{row['lift_ci_low']:+.2f}, {row['lift_ci_high']:+.2f}]"
-        print(f"   {row['hypothesis_id']:4} {ev['n']:>6} "
-              f"{row['unique_sessions']:>5} {eff_s} {ct['n']:>6} "
+        print(f"   {row['hypothesis_id']:4} {ev['n']:>7} "
+              f"{row['event_sessions']:>7} {eff_s} {ct['n']:>6} "
               f"{ev['mean_signed_return']:>+9.2f} "
               f"{row['control_standardised_mean']:>+9.2f} "
               f"{row['lift']:>+8.2f} {ci:>22} {row['lift_p_value']:>6.3f}")
