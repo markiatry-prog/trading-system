@@ -120,6 +120,12 @@ class MatchingSpec:
     bootstrap_iterations: int = 2000
     bootstrap_seed: int = 20260909
     bootstrap_confidence: float = 0.95
+    # The event-level interval and permutation are DIAGNOSTIC: they exist
+    # only to show how much narrower the discarded IID assumption was.
+    # Answering "is it much narrower" needs far less resolution than the
+    # inference of record, and at full resolution they cost more than
+    # the clustered bootstrap they are there to justify.
+    diagnostic_iterations: int = 400
     permutation_iterations: int = 2000
     permutation_seed: int = 20260909
     # Inference resamples SESSIONS. Below this many, a percentile
@@ -643,11 +649,12 @@ def cluster_bootstrap(event_observations: Sequence[Observation],
 
 def _bootstrap_lift_interval(events_by_stratum, controls_by_stratum,
                              spec: MatchingSpec):
-    """Percentile bootstrap over BOTH arms.
+    """Event-level percentile bootstrap. DIAGNOSTIC ONLY.
 
-    Resampling only the events would treat the control mean as known
-    exactly, which it is not, and would report an interval narrower than
-    the evidence supports.
+    Kept so the cost of the IID assumption is visible per hypothesis
+    rather than merely asserted -- see `cluster_bootstrap` for the
+    inference of record. Runs at `diagnostic_iterations`, which is ample
+    to show that an interval is several times too narrow.
     """
     rng = random.Random(spec.bootstrap_seed)
     events = _values_by_stratum(events_by_stratum)
@@ -655,7 +662,7 @@ def _bootstrap_lift_interval(events_by_stratum, controls_by_stratum,
                 if k in events}
     lifts: List[float] = []
     choices = rng.choices
-    for _ in range(spec.bootstrap_iterations):
+    for _ in range(spec.diagnostic_iterations):
         drawn_events = {k: choices(v, k=len(v)) for k, v in events.items()}
         drawn_controls = {k: choices(v, k=len(v)) for k, v in controls.items()}
         lift = _lift_from_values(drawn_events, drawn_controls)
@@ -692,7 +699,8 @@ def _permutation_p_value(events_by_stratum, controls_by_stratum,
     extreme = 0
     trials = 0
     target = abs(observed)
-    for _ in range(spec.permutation_iterations):
+    for _ in range(min(spec.permutation_iterations,
+                       spec.diagnostic_iterations)):
         drawn_events, drawn_controls = {}, {}
         for key, pool in pooled.items():
             shuffled = list(pool)
