@@ -122,6 +122,10 @@ class MatchingSpec:
     bootstrap_confidence: float = 0.95
     permutation_iterations: int = 2000
     permutation_seed: int = 20260909
+    # Inference resamples SESSIONS. Below this many, a percentile
+    # interval over clusters is not meaningful and none is reported --
+    # a wide interval is honest, a fabricated one is not.
+    min_sessions_for_inference: int = 10
     # Symmetric threshold for the "+X before -Y" question, in multiples
     # of the ATR knowable at the anchor -- so it means the same thing in
     # a quiet week and a violent one.
@@ -225,8 +229,15 @@ class ArmStats:
 
 @dataclass
 class Observation:
-    """One measured forward path, reduced to what the comparison needs."""
+    """One measured forward path, reduced to what the comparison needs.
+
+    `session_date` is the CLUSTER. Events inside one session share a
+    regime, a news cycle and often overlapping forward windows, so they
+    are nothing like independent draws; inference resamples sessions,
+    not observations, and needs to know which session each came from.
+    """
     stratum_key: Tuple[int, str]
+    session_date: str
     signed_return: float
     mfe: float
     mae: float
@@ -250,9 +261,20 @@ class BaselineComparison:
     # fires at the open against the average moment of the night.
     control_standardised_mean: Optional[float] = None
     lift: Optional[float] = None
+    # THE INFERENCE OF RECORD: sessions resampled as clusters.
     lift_ci_low: Optional[float] = None
     lift_ci_high: Optional[float] = None
     lift_p_value: Optional[float] = None
+    inference_unit: str = "session_cluster"
+    unique_sessions: int = 0
+    effective_clusters: Optional[float] = None
+    # The event-level figures, kept only so the difference is visible.
+    # They treat every event as an independent draw, which events inside
+    # one session are not, so they are narrower than the evidence
+    # supports and must never be quoted as the result.
+    event_level_ci_low: Optional[float] = None
+    event_level_ci_high: Optional[float] = None
+    event_level_p_value: Optional[float] = None
     mfe_lift: Optional[float] = None
     mae_lift: Optional[float] = None
     favorable_first_lift: Optional[float] = None
@@ -262,6 +284,19 @@ class BaselineComparison:
     events_dropped_for_thin_strata: int = 0
     spec_digest: str = ""
     note: str = ""
+
+    @property
+    def clustering_changes_the_conclusion(self) -> Optional[bool]:
+        """Did treating events as independent flip the answer?
+
+        The number the operator asked for: whether event-level and
+        session-clustered inference materially differ.
+        """
+        clustered = self.lift_excludes_zero
+        if clustered is None or self.event_level_ci_low is None:
+            return None
+        naive = (self.event_level_ci_low > 0) or (self.event_level_ci_high < 0)
+        return naive != clustered
 
     @property
     def lift_excludes_zero(self) -> Optional[bool]:
@@ -280,6 +315,14 @@ class BaselineComparison:
             "lift_ci_low": self.lift_ci_low, "lift_ci_high": self.lift_ci_high,
             "lift_ci_excludes_zero": self.lift_excludes_zero,
             "lift_p_value": self.lift_p_value,
+            "inference_unit": self.inference_unit,
+            "unique_sessions": self.unique_sessions,
+            "effective_clusters": self.effective_clusters,
+            "event_level_ci_low": self.event_level_ci_low,
+            "event_level_ci_high": self.event_level_ci_high,
+            "event_level_p_value": self.event_level_p_value,
+            "clustering_changes_the_conclusion":
+                self.clustering_changes_the_conclusion,
             "mfe_lift": self.mfe_lift, "mae_lift": self.mae_lift,
             "favorable_first_lift": self.favorable_first_lift,
             "hit_first_lift": self.hit_first_lift,
@@ -413,9 +456,27 @@ def compare_to_baseline(hypothesis: Hypothesis, partition: str,
         if arm and base is not None:
             setattr(result, attr, (sum(arm) / len(arm)) - base)
 
-    low, high = _bootstrap_lift_interval(kept_events, usable, spec)
-    result.lift_ci_low, result.lift_ci_high = low, high
-    result.lift_p_value = _permutation_p_value(
+    # THE INFERENCE OF RECORD. Sessions are the unit: see
+    # `cluster_bootstrap` for why events inside one are not independent.
+    matched_controls = [o for k, v in usable.items() if k in kept_events
+                        for o in v]
+    low, high, p, sessions = cluster_bootstrap(matched_events,
+                                               matched_controls, spec)
+    result.lift_ci_low, result.lift_ci_high, result.lift_p_value = low, high, p
+    result.unique_sessions = sessions
+    result.effective_clusters = effective_clusters(matched_events)
+    if low is None:
+        result.note = (
+            f"{sessions} sessions support this estimate, below the "
+            f"{spec.min_sessions_for_inference} needed to resample clusters; "
+            f"no interval is reported rather than a falsely narrow one."
+            + (f" {result.note}" if result.note else ""))
+
+    # Event-level, for comparison ONLY. Reported so the cost of the old
+    # IID assumption is visible instead of merely asserted.
+    naive_low, naive_high = _bootstrap_lift_interval(kept_events, usable, spec)
+    result.event_level_ci_low, result.event_level_ci_high = naive_low, naive_high
+    result.event_level_p_value = _permutation_p_value(
         kept_events, usable, result.lift, spec)
     return result
 
@@ -451,6 +512,133 @@ def _lift_from_values(event_values: Mapping[Tuple[int, str], List[float]],
     if weight_used == 0:
         return None
     return (event_sum / total) - (control_total / weight_used)
+
+
+def cluster_contributions(observations: Sequence[Observation]
+                          ) -> Dict[str, Dict[Tuple[int, str], Tuple[float, int]]]:
+    """Per session, per stratum: (sum of signed returns, count).
+
+    The stratified lift is a function of per-stratum sums and counts
+    only -- see `_lift_from_values` -- so a session's entire
+    contribution collapses to a handful of numbers. A bootstrap
+    iteration is then addition rather than list building, which is what
+    makes resampling 1,234 sessions two thousand times affordable.
+    """
+    out: Dict[str, Dict[Tuple[int, str], Tuple[float, int]]] = {}
+    for o in observations:
+        per_stratum = out.setdefault(o.session_date, {})
+        total, count = per_stratum.get(o.stratum_key, (0.0, 0))
+        per_stratum[o.stratum_key] = (total + o.signed_return, count + 1)
+    return out
+
+
+def effective_clusters(observations: Sequence[Observation]) -> Optional[float]:
+    """Kish effective sample size over sessions.
+
+    (sum n_s)^2 / sum n_s^2. Equal to the session count when every
+    session contributes equally, and collapsing toward 1 when one
+    session contributes most of the observations -- which is exactly the
+    situation where a raw event count overstates the evidence. 400
+    events from three sessions are not 400 confirmations.
+    """
+    per_session: Dict[str, int] = {}
+    for o in observations:
+        per_session[o.session_date] = per_session.get(o.session_date, 0) + 1
+    counts = list(per_session.values())
+    if not counts:
+        return None
+    total = sum(counts)
+    return (total * total) / sum(c * c for c in counts)
+
+
+def _lift_from_totals(event_totals, control_totals) -> Optional[float]:
+    """The same estimator as `_lift_from_values`, from sums and counts."""
+    total = sum(n for _s, n in event_totals.values())
+    if not total:
+        return None
+    event_sum = sum(s for s, _n in event_totals.values())
+    control_total = 0.0
+    weight_used = 0.0
+    for key, (_esum, ecount) in event_totals.items():
+        control = control_totals.get(key)
+        if not control or control[1] == 0:
+            continue
+        weight = ecount / total
+        control_total += weight * (control[0] / control[1])
+        weight_used += weight
+    if weight_used == 0:
+        return None
+    return (event_sum / total) - (control_total / weight_used)
+
+
+def cluster_bootstrap(event_observations: Sequence[Observation],
+                      control_observations: Sequence[Observation],
+                      spec: MatchingSpec):
+    """Percentile bootstrap resampling SESSIONS, not observations.
+
+    THE PROBLEM WITH RESAMPLING OBSERVATIONS. Events inside one session
+    share a volatility regime, a news cycle, and frequently overlapping
+    forward windows -- two ORB breaks twenty minutes apart are largely
+    the same forty minutes of tape. Resampling them independently treats
+    each as fresh evidence, so a study drawing 400 events from three
+    unusual sessions reports the interval of 400 independent
+    observations. It is not merely optimistic; it is the mechanism by
+    which one strange week becomes a discovery.
+
+    Sessions are drawn WITH REPLACEMENT and every eligible observation
+    belonging to a drawn session comes with it, in both arms and across
+    every stratum. A session drawn twice contributes twice; a session
+    not drawn contributes nothing. The matching strata are preserved
+    inside each resample -- the lift is recomputed by the same
+    standardisation, so a resample that happens to omit a stratum
+    renormalises over the rest rather than silently comparing unlike
+    things.
+
+    Both arms are drawn from the SAME sampled sessions, because a
+    session's controls and its events share whatever made that session
+    unusual, and breaking that pairing would put some of the dependence
+    back.
+
+    Returns (ci_low, ci_high, two_sided_p, n_sessions).
+    """
+    events = cluster_contributions(event_observations)
+    controls = cluster_contributions(control_observations)
+    sessions = sorted(set(events) | set(controls))
+    if len(sessions) < spec.min_sessions_for_inference:
+        return None, None, None, len(sessions)
+
+    rng = random.Random(spec.bootstrap_seed)
+    choices = rng.choices
+    lifts: List[float] = []
+    for _ in range(spec.bootstrap_iterations):
+        event_totals: Dict[Tuple[int, str], Tuple[float, int]] = {}
+        control_totals: Dict[Tuple[int, str], Tuple[float, int]] = {}
+        for session in choices(sessions, k=len(sessions)):
+            for key, (value, count) in events.get(session, {}).items():
+                have = event_totals.get(key)
+                event_totals[key] = ((have[0] + value, have[1] + count)
+                                     if have else (value, count))
+            for key, (value, count) in controls.get(session, {}).items():
+                have = control_totals.get(key)
+                control_totals[key] = ((have[0] + value, have[1] + count)
+                                       if have else (value, count))
+        lift = _lift_from_totals(event_totals, control_totals)
+        if lift is not None:
+            lifts.append(lift)
+    if len(lifts) < 2:
+        return None, None, None, len(sessions)
+
+    lifts.sort()
+    tail = (1.0 - spec.bootstrap_confidence) / 2.0
+    low = lifts[max(0, int(tail * len(lifts)))]
+    high = lifts[min(len(lifts) - 1, int((1.0 - tail) * len(lifts)))]
+    # Two-sided percentile p: how much of the resampled distribution sits
+    # on the far side of zero. Add-one, because a finite number of
+    # resamples cannot support a p-value of exactly zero.
+    below = sum(1 for v in lifts if v <= 0)
+    above = sum(1 for v in lifts if v >= 0)
+    p = min(1.0, 2.0 * (min(below, above) + 1) / (len(lifts) + 1))
+    return low, high, p, len(sessions)
 
 
 def _bootstrap_lift_interval(events_by_stratum, controls_by_stratum,
@@ -569,8 +757,9 @@ class ControlPool:
                 "anchors_kept": sum(len(v) for v in self._kept.values())}
 
 
-def _observation_from_path(path: ForwardPath, stratum_key, direction: Direction,
-                           scanner, atr: Optional[Decimal],
+def _observation_from_path(path: ForwardPath, stratum_key, session_date: str,
+                           direction: Direction, scanner,
+                           atr: Optional[Decimal],
                            spec: MatchingSpec) -> Optional[Observation]:
     if path.bars_observed == 0:
         return None
@@ -586,6 +775,7 @@ def _observation_from_path(path: ForwardPath, stratum_key, direction: Direction,
             # "neither" and "same_bar" are genuinely unknown, not False
     return Observation(
         stratum_key=stratum_key,
+        session_date=session_date,
         signed_return=float(path.signed_return(direction)),
         mfe=float(path.mfe(direction)),
         mae=float(path.mae(direction)),
@@ -594,31 +784,65 @@ def _observation_from_path(path: ForwardPath, stratum_key, direction: Direction,
     )
 
 
+def measure_anchor_paths(anchors: Sequence[Anchor], bars: Sequence[Bar],
+                         horizon_minutes: int,
+                         bar_index: Optional[BarWindowIndex] = None) -> List:
+    """Forward paths for a set of anchors, once, before any direction.
+
+    SPLIT OUT ON PURPOSE. A forward path depends on the anchor, the bars
+    and the horizon -- not on which hypothesis is asking or which way it
+    faces. The frozen set has twelve hypotheses across three distinct
+    horizons, so measuring the control pool per hypothesis did the same
+    work four times over. On the real sample that was the difference
+    between minutes and hours.
+
+    Returns [(anchor, ForwardPath, PathScanner)].
+    """
+    if bar_index is None:
+        bar_index = BarWindowIndex(bars)
+    out = []
+    for anchor in anchors:
+        measured = measure_forward_path("control", anchor.at, bars,
+                                        horizon_minutes, bar_index)
+        if measured is not None:
+            out.append((anchor, measured[0], measured[1]))
+    return out
+
+
+def observations_from_paths(measured: Sequence, direction: Direction,
+                            spec: MatchingSpec,
+                            exclude: Optional[Set[datetime]] = None
+                            ) -> List[Observation]:
+    """Orient measured paths for one hypothesis.
+
+    `exclude` drops anchors that ARE this hypothesis's events, so the
+    control arm never contains the very moments it is the comparison
+    for. Applied here rather than before measurement, because the
+    measurement is shared across hypotheses and the exclusion is not.
+    """
+    out: List[Observation] = []
+    for anchor, path, scanner in measured:
+        if exclude and anchor.at in exclude:
+            continue
+        observation = _observation_from_path(
+            path, anchor.stratum.as_key(), anchor.session_date.isoformat(),
+            direction, scanner, anchor.atr, spec)
+        if observation is not None:
+            out.append(observation)
+    return out
+
+
 def measure_anchors(anchors: Sequence[Anchor], bars: Sequence[Bar],
                     direction: Direction, horizon_minutes: int,
                     spec: MatchingSpec,
                     bar_index: Optional[BarWindowIndex] = None
                     ) -> List[Observation]:
-    """Forward paths for a set of anchors, reduced to Observations.
-
-    Uses exactly the same `measure_forward_path` the event arm uses, so
-    the two arms cannot differ in how a path is measured -- only in where
-    it is anchored.
-    """
-    if bar_index is None:
-        bar_index = BarWindowIndex(bars)
-    out: List[Observation] = []
-    for anchor in anchors:
-        measured = measure_forward_path("control", anchor.at, bars,
-                                        horizon_minutes, bar_index)
-        if measured is None:
-            continue
-        path, scanner = measured
-        observation = _observation_from_path(
-            path, anchor.stratum.as_key(), direction, scanner, anchor.atr, spec)
-        if observation is not None:
-            out.append(observation)
-    return out
+    """Measure and orient in one step. Uses exactly the same
+    `measure_forward_path` the event arm uses, so the two arms cannot
+    differ in how a path is measured -- only in where it is anchored."""
+    return observations_from_paths(
+        measure_anchor_paths(anchors, bars, horizon_minutes, bar_index),
+        direction, spec)
 
 
 class StageArms:

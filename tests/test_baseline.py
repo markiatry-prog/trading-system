@@ -490,3 +490,179 @@ def test_a_condition_that_selects_the_real_effect_shows_a_conditioning_lift():
     result = compare_conditioning(hypothesis(), "discovery", strong, weak, SPEC)
     assert result.lift > 0
     assert result.lift_ci_low > 0
+
+
+# --- the inference unit: sessions, not events -------------------------
+# Events inside one session share a regime, a news cycle and often
+# overlapping forward windows. Resampling them as independent draws
+# turns one unusual week into hundreds of confirmations.
+
+def clustered_market(n_sessions=30, hot_sessions=3, events_per_hot=40,
+                     events_per_cold=1, bump=25.0, bump_bars=3,
+                     minutes=240, seed=11):
+    """A market where almost all events come from a handful of sessions.
+
+    The "hot" sessions carry a real post-event move; the rest carry
+    events that predict nothing. The effect is therefore supported by
+    `hot_sessions` clusters, however many events they contain -- which
+    is precisely what event-level inference cannot see.
+    """
+    import random
+    rnd = random.Random(seed)
+    bars, event_times = [], []
+    index = 0
+    for s in range(n_sessions * 2):
+        session_date = date(2026, 1, 5) + timedelta(days=s)
+        if session_date.weekday() >= 5:
+            continue
+        open_at = CAL.rth_open_at(session_date)
+        if CAL.session_date_for(open_at) != session_date:
+            continue
+        if index >= n_sessions:
+            break
+        hot = index < hot_sessions
+        n_events = events_per_hot if hot else events_per_cold
+        stride = max(1, (minutes - HORIZON - 10) // max(1, n_events))
+        fire_at = {5 + i * stride for i in range(n_events)}
+        px, bump_left = 20000.0, 0
+        for i in range(minutes):
+            drift = rnd.uniform(-1.0, 1.0)
+            if bump_left > 0 and hot:
+                drift += bump
+                bump_left -= 1
+            close = px + drift
+            at = open_at + timedelta(minutes=i)
+            bars.append(Bar(
+                instrument=NQ, interval_seconds=60,
+                open=Decimal(str(round(px, 2))),
+                high=Decimal(str(round(max(px, close) + 0.5, 2))),
+                low=Decimal(str(round(min(px, close) - 0.5, 2))),
+                close=Decimal(str(round(close, 2))), volume=100,
+                observed_at=at, captured_at=at + timedelta(milliseconds=50),
+                provider="synthetic"))
+            if i in fire_at and i < minutes - HORIZON - 5:
+                event_times.append(at + timedelta(minutes=1))
+                bump_left = bump_bars
+            px = close
+        index += 1
+    return bars, event_times
+
+
+def test_many_events_from_few_sessions_do_not_give_a_narrow_interval():
+    """The headline requirement.
+
+    Almost every event comes from three sessions. Event-level inference
+    sees hundreds of confirmations; session-clustered inference sees
+    three, and its interval must be far wider for it.
+    """
+    bars, events = clustered_market()
+    result, _ = run_comparison(bars, events)
+
+    assert result.event.n > 100, f"only {result.event.n} events"
+    assert result.unique_sessions > 10, "the control arm spans many sessions"
+    assert result.effective_clusters is not None
+    assert result.effective_clusters < 10, (
+        f"effective clusters {result.effective_clusters:.1f} should collapse "
+        f"toward the handful of sessions actually carrying the effect")
+
+    clustered_width = result.lift_ci_high - result.lift_ci_low
+    naive_width = result.event_level_ci_high - result.event_level_ci_low
+    assert clustered_width > naive_width * 2, (
+        f"clustered interval {clustered_width:.2f} is not materially wider "
+        f"than the event-level {naive_width:.2f}; the clustering is not "
+        f"doing anything")
+
+
+def test_the_effective_cluster_count_exposes_the_concentration():
+    bars, events = clustered_market()
+    result, _ = run_comparison(bars, events)
+    assert result.effective_clusters < result.event.n / 10, (
+        f"{result.event.n} events but only "
+        f"{result.effective_clusters:.1f} effective clusters -- the ratio is "
+        f"the warning, and it must be visible")
+    row = result.as_row()
+    for key in ("inference_unit", "unique_sessions", "effective_clusters",
+                "event_level_ci_low", "event_level_ci_high",
+                "event_level_p_value", "clustering_changes_the_conclusion"):
+        assert key in row, key
+    assert row["inference_unit"] == "session_cluster"
+
+
+def test_evenly_spread_events_are_not_penalised_by_clustering():
+    """Clustering must be calibrated, not merely conservative: when
+    events really are spread across many sessions, the two intervals
+    should be comparable."""
+    bars, events = clustered_market(n_sessions=30, hot_sessions=30,
+                                    events_per_hot=2, events_per_cold=2)
+    result, _ = run_comparison(bars, events)
+    assert result.effective_clusters > 20, (
+        f"effective clusters {result.effective_clusters:.1f} should be near "
+        f"the session count when events are spread evenly")
+    clustered_width = result.lift_ci_high - result.lift_ci_low
+    naive_width = result.event_level_ci_high - result.event_level_ci_low
+    assert clustered_width < naive_width * 3, (
+        f"clustered {clustered_width:.2f} vs event-level {naive_width:.2f}: "
+        f"clustering is inflating an interval it should barely change")
+
+
+def test_effective_clusters_is_the_session_count_when_spread_evenly():
+    obs = [Observation(stratum_key=(0, "unknown"), session_date=f"2026-01-{d:02d}",
+                       signed_return=1.0, mfe=1.0, mae=0.0,
+                       favorable_first=True, hit_first_favorable=None)
+           for d in range(1, 11) for _ in range(5)]
+    from trading_system.research.baseline import effective_clusters
+    assert effective_clusters(obs) == pytest.approx(10.0)
+
+
+def test_effective_clusters_collapses_when_one_session_dominates():
+    from trading_system.research.baseline import effective_clusters
+    obs = ([Observation((0, "u"), "2026-01-01", 1.0, 1.0, 0.0, True, None)] * 100
+           + [Observation((0, "u"), f"2026-01-{d:02d}", 1.0, 1.0, 0.0, True, None)
+              for d in range(2, 5)])
+    # 103 observations, but one session holds 100 of them.
+    assert effective_clusters(obs) < 1.2
+
+
+def test_too_few_sessions_reports_no_interval_rather_than_a_narrow_one():
+    strict = MatchingSpec(min_controls_per_stratum=5,
+                          max_controls_per_stratum=200,
+                          min_sessions_for_inference=500,
+                          bootstrap_iterations=100, permutation_iterations=100)
+    bars, events = clustered_market()
+    result, _ = run_comparison(bars, events, spec=strict)
+    assert result.lift is not None, "the point estimate is still computable"
+    assert result.lift_ci_low is None and result.lift_p_value is None
+    assert "below the" in result.note and "resample clusters" in result.note
+
+
+def test_a_session_drawn_twice_contributes_twice():
+    """The defining property of a cluster bootstrap, asserted directly."""
+    from trading_system.research.baseline import cluster_contributions
+    obs = [Observation((0, "u"), "2026-01-01", 2.0, 2.0, 0.0, True, None),
+           Observation((0, "u"), "2026-01-01", 4.0, 4.0, 0.0, True, None),
+           Observation((1, "u"), "2026-01-02", 6.0, 6.0, 0.0, True, None)]
+    contributions = cluster_contributions(obs)
+    assert contributions["2026-01-01"][(0, "u")] == (6.0, 2)
+    assert contributions["2026-01-02"][(1, "u")] == (6.0, 1)
+    assert set(contributions) == {"2026-01-01", "2026-01-02"}
+
+
+def test_every_observation_records_the_session_it_came_from():
+    bars, events = synthetic_market()
+    arms, records = build_arms(bars, events)
+    index = BarWindowIndex(bars)
+    obs, _ = arms.event_observations(records, bars, Direction.UP, HORIZON, index)
+    assert obs
+    assert all(o.session_date for o in obs)
+    assert len({o.session_date for o in obs}) > 1
+
+
+def test_the_clustered_bootstrap_is_deterministic():
+    from trading_system.research.baseline import cluster_bootstrap
+    bars, events = clustered_market()
+    arms, records = build_arms(bars, events)
+    index = BarWindowIndex(bars)
+    ev, _ = arms.event_observations(records, bars, Direction.UP, HORIZON, index)
+    pool = arms.build_control_pool({e.available_at for e in records})
+    ct = measure_anchors(pool.anchors(), bars, Direction.UP, HORIZON, SPEC, index)
+    assert cluster_bootstrap(ev, ct, SPEC) == cluster_bootstrap(ev, ct, SPEC)

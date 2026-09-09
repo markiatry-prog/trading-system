@@ -34,10 +34,19 @@ WHAT A RESULT MEANS
   lift          event mean minus the standardised control mean, in
                 points, signed so positive means the PREREGISTERED
                 direction was right
-  lift CI       percentile bootstrap over both arms
-  lift p        stratified permutation, assuming no distribution
+  lift CI       percentile bootstrap resampling SESSIONS as clusters
+  lift p        two-sided, from that same clustered distribution
+  eff           effective cluster count. Far below the event count means
+                a few sessions carry the result
   absolute      the T-004 quantity, reported alongside so the two can
                 be compared directly
+
+THE INFERENCE UNIT IS THE SESSION. Events inside one session share a
+volatility regime, a news cycle, and frequently overlapping forward
+windows: two breaks twenty minutes apart are largely the same tape.
+Resampling them independently would let one unusual week present itself
+as hundreds of confirmations. The event-level interval is reported
+alongside, purely so the size of that difference is visible.
 
 A hypothesis whose absolute effect is large and whose lift is ~0 was
 measuring the market's drift, not the event.
@@ -63,7 +72,7 @@ from trading_system.features.records import FeatureType
 from trading_system.market_data import Instrument
 from trading_system.research.baseline import (
     BASELINE_VERSION, MatchingSpec, StageArms, compare_conditioning,
-    compare_to_baseline, measure_anchors)
+    compare_to_baseline, measure_anchor_paths, observations_from_paths)
 from trading_system.research.checkpoint import (
     CheckpointError, CheckpointKey, StudyCheckpoint)
 from trading_system.research.eligibility import filter_eligible
@@ -262,8 +271,30 @@ def main() -> int:
         progress.finish()
 
         index = BarWindowIndex(stage_bars)
+
+        # ONE control pool for the stage, and its forward paths measured
+        # ONCE PER DISTINCT HORIZON rather than once per hypothesis. A
+        # path depends on the anchor, the bars and the horizon -- not on
+        # which hypothesis is asking or which way it faces -- and the
+        # twelve frozen hypotheses use three horizons between them.
+        # Per-hypothesis exclusion and direction are applied afterwards,
+        # to the measured paths, which is exact and far cheaper.
+        pool = arms.build_control_pool(set())
+        horizons = sorted({h.horizon_minutes for h in registry.all()})
+        prep = StageProgress(f"{stage.value}/controls", len(horizons),
+                             unit="horizons", min_interval=0.0,
+                             counter_labels=("anchors", "paths"))
+        control_paths = {}
+        for horizon in horizons:
+            control_paths[horizon] = measure_anchor_paths(
+                pool.anchors(), stage_bars, horizon, index)
+            prep.advance(len(pool.anchors()), len(control_paths[horizon]))
+        prep.finish()
+
         rows = []
-        compare = StageProgress(f"{stage.value}/compare", registry.count())
+        compare = StageProgress(f"{stage.value}/compare", registry.count(),
+                                unit="hypotheses", min_interval=0.0,
+                                counter_labels=("controls", "events"))
         for h in registry.all():
             candidates = [e for e in events if e.type == h.event_type]
             candidates, eligibility = filter_eligible(h, candidates, contracts)
@@ -280,11 +311,9 @@ def main() -> int:
 
             event_obs, unmatched = arms.event_observations(
                 conditioned, stage_bars, h.direction, h.horizon_minutes, index)
-            pool = arms.build_control_pool(
-                {e.available_at for e in candidates})
-            control_obs = measure_anchors(
-                pool.anchors(), stage_bars, h.direction, h.horizon_minutes,
-                spec, index)
+            control_obs = observations_from_paths(
+                control_paths[h.horizon_minutes], h.direction, spec,
+                exclude={e.available_at for e in candidates})
             comparison = compare_to_baseline(h, stage.value, event_obs,
                                              control_obs, spec)
             row = comparison.as_row()
@@ -299,7 +328,7 @@ def main() -> int:
                 row["conditioning_contrast"] = compare_conditioning(
                     h, stage.value, event_obs, other_obs, spec).as_row()
             rows.append(row)
-            compare.advance(0, len(event_obs))
+            compare.advance(len(control_obs), len(event_obs))
         compare.finish()
 
         all_rows[stage.value] = rows
@@ -311,22 +340,53 @@ def main() -> int:
 
     print(f"\n   total {format_duration(time.perf_counter() - run_started)}\n")
 
-    print("7. BASELINE-RELATIVE LIFT (discovery)\n")
-    header = (f"   {'id':4} {'n_ev':>6} {'n_ctl':>6} {'absolute':>9} "
-              f"{'baseline':>9} {'lift':>8} {'95% CI':>18} {'p':>6}")
+    print("7. BASELINE-RELATIVE LIFT (discovery)")
+    print("   Inference resamples SESSIONS as clusters. Events inside one")
+    print("   session share a regime and overlapping forward windows, so")
+    print("   they are not independent observations.\n")
+    header = (f"   {'id':4} {'n_ev':>6} {'sess':>5} {'eff':>6} {'n_ctl':>6} "
+              f"{'absolute':>9} {'baseline':>9} {'lift':>8} "
+              f"{'95% CI (clustered)':>22} {'p':>6}")
     print(header)
     print("   " + "-" * (len(header) - 3))
     for row in all_rows.get(Partition.DISCOVERY.value, []):
         ev, ct = row["event"], row["control"]
-        if row["lift"] is None:
-            print(f"   {row['hypothesis_id']:4} {ev['n']:>6} {ct['n']:>6}"
-                  f"   {row['note'][:60]}")
+        eff = row.get("effective_clusters")
+        eff_s = f"{eff:>6.1f}" if eff is not None else "     -"
+        if row["lift"] is None or row["lift_ci_low"] is None:
+            print(f"   {row['hypothesis_id']:4} {ev['n']:>6} "
+                  f"{row.get('unique_sessions', 0):>5} {eff_s} {ct['n']:>6}"
+                  f"   {row['note'][:56]}")
             continue
         ci = f"[{row['lift_ci_low']:+.2f}, {row['lift_ci_high']:+.2f}]"
-        print(f"   {row['hypothesis_id']:4} {ev['n']:>6} {ct['n']:>6} "
+        print(f"   {row['hypothesis_id']:4} {ev['n']:>6} "
+              f"{row['unique_sessions']:>5} {eff_s} {ct['n']:>6} "
               f"{ev['mean_signed_return']:>+9.2f} "
               f"{row['control_standardised_mean']:>+9.2f} "
-              f"{row['lift']:>+8.2f} {ci:>18} {row['lift_p_value']:>6.3f}")
+              f"{row['lift']:>+8.2f} {ci:>22} {row['lift_p_value']:>6.3f}")
+
+    print("\n7b. HOW MUCH THE INFERENCE UNIT MATTERS\n")
+    print(f"   {'id':4} {'clustered CI':>24} {'event-level CI':>24} "
+          f"{'width':>7}  conclusion")
+    print("   " + "-" * 74)
+    for row in all_rows.get(Partition.DISCOVERY.value, []):
+        if row["lift_ci_low"] is None or row["event_level_ci_low"] is None:
+            continue
+        clustered = row["lift_ci_high"] - row["lift_ci_low"]
+        naive = row["event_level_ci_high"] - row["event_level_ci_low"]
+        ratio = clustered / naive if naive else float("inf")
+        flips = row["clustering_changes_the_conclusion"]
+        verdict = ("CHANGES the conclusion" if flips
+                   else "same conclusion")
+        print(f"   {row['hypothesis_id']:4} "
+              f"[{row['lift_ci_low']:+8.2f},{row['lift_ci_high']:+8.2f}] "
+              f"[{row['event_level_ci_low']:+8.2f},"
+              f"{row['event_level_ci_high']:+8.2f}] "
+              f"{ratio:>6.1f}x  {verdict}")
+    print("\n   A large widening factor means the events were concentrated")
+    print("   in few sessions and the event-level interval was fiction.")
+    print("   Compare n_ev against eff: 400 events over 4 effective")
+    print("   clusters are not 400 confirmations.")
 
     print("\n8. WHAT MOVED WHEN THE BASELINE WAS SUBTRACTED\n")
     for row in all_rows.get(Partition.DISCOVERY.value, []):

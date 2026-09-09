@@ -34,9 +34,19 @@ class StageProgress:
 
     def __init__(self, stage: str, total_sessions: int,
                  stream: Optional[TextIO] = None, min_interval: float = 5.0,
-                 clock=time.monotonic):
+                 clock=time.monotonic, unit: str = "sessions",
+                 counter_labels: tuple = ("bars", "events")):
         self.stage = stage
         self.total_sessions = max(1, total_sessions)
+        # What is being counted. The comparison stage walks hypotheses,
+        # not sessions, and a line reading "3/12 sessions" there would
+        # be quietly wrong about what the run is doing.
+        self.unit = unit
+        # The two running counters. The scan stage reads bars and emits
+        # events; the comparison stage measures control paths and event
+        # paths. Same shape, different nouns, and printing the wrong one
+        # would misdescribe what the run is doing.
+        self.counter_labels = counter_labels
         self.stream = stream if stream is not None else sys.stdout
         self.min_interval = min_interval
         self._clock = clock
@@ -65,9 +75,10 @@ class StageProgress:
         eta = (elapsed / fraction - elapsed) if fraction > 0 else 0.0
         checkpoint = (f"  ckpt {self.last_checkpoint[11:19]}"
                       if self.last_checkpoint else "  ckpt none")
-        return (f"   {self.stage:11} {self.sessions:>5}/{self.total_sessions} "
-                f"sessions {fraction:>6.1%}  {self.bars:>10,} bars  "
-                f"{self.events:>8,} events  "
+        return (f"   {self.stage:19} {self.sessions:>5}/{self.total_sessions} "
+                f"{self.unit} {fraction:>6.1%}  "
+                f"{self.bars:>10,} {self.counter_labels[0]}  "
+                f"{self.events:>8,} {self.counter_labels[1]}  "
                 f"elapsed {format_duration(elapsed):>9}  "
                 f"ETA ~{format_duration(eta):>9}{checkpoint}")
 

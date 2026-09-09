@@ -47,16 +47,64 @@ means, weighted by how the *events* are distributed across strata. It is
 deterministic — no matched-pair draw, so no sampling noise in the point
 estimate.
 
-- **Interval**: percentile bootstrap over *both* arms. Resampling only the
-  events would treat the control mean as exactly known and report an
-  interval narrower than the evidence supports.
-- **p-value**: stratified permutation, relabelling event and control within
-  each stratum. Neither assumes a distribution — one-minute forward returns
-  are heavy-tailed and skewed.
+## The inference unit is the SESSION, not the event
+
+Events inside one session share a volatility regime, a news cycle, and
+frequently overlapping forward windows — two opening-range breaks twenty
+minutes apart are largely the same forty minutes of tape. Treating them as
+independent draws is not merely optimistic; it is the mechanism by which
+one unusual week becomes a discovery.
+
+- **Interval**: percentile bootstrap resampling **sessions with
+  replacement**, retaining every eligible observation belonging to a drawn
+  session, in both arms and across every stratum. A session drawn twice
+  contributes twice. Both arms are drawn from the *same* sampled sessions,
+  because a session's events and its controls share whatever made that
+  session unusual.
+- **Matching strata are preserved inside each resample** — the lift is
+  recomputed by the same standardisation, and a resample that happens to
+  omit a stratum renormalises over the rest rather than comparing unlike
+  things.
+- **p-value**: two-sided, from that same clustered distribution. No
+  distributional assumption — one-minute forward returns are heavy-tailed
+  and skewed.
+- **Below 10 supporting sessions**, no interval is reported at all. A wide
+  interval is honest; a fabricated one is not.
+
+### How repeated events from one session contribute
+
+A session's events all enter the point estimate — none are discarded, and
+a session with forty events contributes all forty to the stratified mean.
+What changes is the *uncertainty*: because the resampling unit is the
+session, those forty rise and fall together across bootstrap draws, so they
+widen the interval instead of narrowing it.
+
+**Effective cluster count** (Kish, `(Σnₛ)² / Σnₛ²`) is reported next to the
+raw event count. It equals the session count when events are spread evenly
+and collapses toward 1 when one session dominates. A large gap between the
+two is the warning that a raw event count overstates the evidence.
+
+Measured on synthetic data where almost every event comes from three
+sessions:
+
+| | events | effective clusters | 95% CI | width | p |
+|---|---|---|---|---|---|
+| event-level (IID) | 147 | — | [+287.5, +326.8] | 39.3 | 0.003 |
+| **session-clustered** | 147 | **4.5** | [+0.00, +316.3] | **316.3** | **0.053** |
+
+The event-level interval is 8× too narrow and reports a rock-solid finding.
+When events *are* spread evenly across 30 sessions, the clustered interval
+is 0.9× the event-level one — so the clustering is calibrated, not merely
+conservative.
+
+The event-level interval and permutation p-value are still reported, purely
+so the size of that difference is visible per hypothesis, together with a
+`clustering_changes_the_conclusion` flag. **They are never the result.**
 
 Reported per hypothesis: event and control arm statistics with both sample
-sizes, the standardised comparator, absolute effect, lift, lift CI, lift
-p-value, MFE/MAE lift, and the ordering ("+X before −Y") lift.
+sizes, unique sessions, effective clusters, the standardised comparator,
+absolute effect, lift, clustered lift CI and p-value, the event-level
+comparison, MFE/MAE lift, and the ordering ("+X before −Y") lift.
 
 ## Two known biases, both conservative
 
