@@ -244,14 +244,34 @@ def main() -> int:
     progress.finish()
 
     # Which declared predecessors fired within the sequence window.
+    #
+    # A SLIDING WINDOW, not a scan per bar. There are ~870,000 bar
+    # closes and ~174,000 predecessor events in the discovery period;
+    # asking "which fired in the last thirty minutes" by scanning the
+    # event list at every close is 150 billion comparisons and would
+    # have run for days. Both sequences are sorted in time, so one sweep
+    # with a deque and a running count answers every close in O(n + m).
+    from collections import Counter, deque
+
     window = timedelta(minutes=space.predecessor_window_minutes)
     fired = sorted(
         (e.available_at, e.type) for t in space.predecessors
         for e in events_by_type.get(t, []))
-    for at in all_tags:
+    live = deque()
+    counts = Counter()
+    cursor = 0
+    for at in sorted(all_tags):
+        while cursor < len(fired) and fired[cursor][0] <= at:
+            live.append(fired[cursor])
+            counts[fired[cursor][1]] += 1
+            cursor += 1
         cutoff = at - window
-        recent_by_time[at] = frozenset(
-            t for when, t in fired if cutoff <= when <= at)
+        while live and live[0][0] < cutoff:
+            _when, kind = live.popleft()
+            counts[kind] -= 1
+            if counts[kind] == 0:
+                del counts[kind]
+        recent_by_time[at] = frozenset(counts)
 
     def third_of(session_date) -> int:
         return 0 if session_date < thirds[0] else (

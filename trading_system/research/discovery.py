@@ -415,10 +415,15 @@ def screen_candidates(candidates: Sequence[Candidate],
     plain = _condition_sets(space.max_conditions)
     with_pred = _condition_sets(space.max_conditions_with_predecessor)
 
-    cache: Dict[Tuple[str, int, Optional[str], str], Tuple] = {}
+    cache: Dict[Tuple, Tuple] = {}
 
     def cells_for(anchor, horizon, predecessor, arm):
-        key = (anchor, horizon, predecessor, arm)
+        # The control pool does not depend on the anchor -- it is the
+        # same set of non-event moments whichever event is being asked
+        # about -- so its key must not mention one. Keying it by anchor
+        # recomputed the whole control accumulation thirteen times.
+        key = ((anchor, horizon, predecessor, "e") if arm == "e"
+               else (horizon, predecessor, "c"))
         if key not in cache:
             sets = plain if predecessor is None else with_pred
             source = (events_by_anchor.get((anchor, horizon), []) if arm == "e"
