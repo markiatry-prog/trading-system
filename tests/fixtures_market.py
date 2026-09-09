@@ -51,3 +51,43 @@ def series_with_swing_high(peak_at=5, n=12, start=20000):
             o, h, l, c = top - 2, top, top - 4, top - 1
         out.append(bar(i, o, h, l, c))
     return out
+
+
+# --- multi-session load, for equivalence and benchmark work -----------
+# Deterministic by construction: the only randomness is a seeded Random
+# whose seed is derived from the session index, so the same call always
+# produces the same bars. A fixture that differed between runs could not
+# prove that two code paths agree.
+
+def synthetic_session(day_index, base=20000, minutes=1397, instrument=NQ,
+                      origin=None, contract_id="GLBX.MDP3:1001"):
+    """One ~23h session of one-minute bars, shaped like the real NQ tape."""
+    import random
+    rnd = random.Random(day_index * 7919 + 13)
+    start = (origin or datetime(2021, 9, 6, 22, 0, tzinfo=timezone.utc)) \
+        + timedelta(days=day_index)
+    out = []
+    px = base
+    for i in range(minutes):
+        close = px + rnd.randint(-8, 8)
+        high = max(px, close) + rnd.randint(0, 6)
+        low = min(px, close) - rnd.randint(0, 6)
+        out.append(bar(i, px, high, low, close, volume=rnd.randint(1, 500),
+                       instrument=instrument, origin=start,
+                       contract_id=contract_id))
+        px = close
+    return out
+
+
+def synthetic_sessions(n, minutes=1397, roll_after=None):
+    """`n` consecutive sessions, optionally rolling contract partway.
+
+    Returns {day_index: [Bar]} so callers can gate or partition by day
+    the way the runner does.
+    """
+    out = {}
+    for i in range(n):
+        cid = ("GLBX.MDP3:2002" if roll_after is not None and i >= roll_after
+               else "GLBX.MDP3:1001")
+        out[i] = synthetic_session(i, minutes=minutes, contract_id=cid)
+    return out

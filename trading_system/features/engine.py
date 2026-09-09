@@ -107,9 +107,11 @@ class FeatureEngine:
         self._or_high_broken = False
         self._or_low_broken = False
 
-        # structure
-        self._confirmed_swing_highs: List[Tuple[datetime, Decimal]] = []
-        self._confirmed_swing_lows: List[Tuple[datetime, Decimal]] = []
+        # structure. Only the LAST confirmed pivot in each direction is
+        # read -- by _detect_structure_breaks, which consumes and clears
+        # it. Two lists accumulating every pivot ever confirmed used to
+        # live here; nothing ever read them, and at 1,234 sessions they
+        # held about 190,000 tuples apiece.
         self._last_structure_high: Optional[Decimal] = None
         self._last_structure_low: Optional[Decimal] = None
 
@@ -396,13 +398,11 @@ class FeatureEngine:
         right = window[k + 1:]
         sd = self.calendar.session_date_for(candidate.observed_at)
         if all(candidate.high > b.high for b in left + right):
-            self._confirmed_swing_highs.append((candidate.observed_at, candidate.high))
             self._last_structure_high = candidate.high
             out.append(self._record(RecordKind.FEATURE, FeatureType.SWING_HIGH,
                                     candidate.observed_at, at, sd,
                                     value=candidate.high))
         if all(candidate.low < b.low for b in left + right):
-            self._confirmed_swing_lows.append((candidate.observed_at, candidate.low))
             self._last_structure_low = candidate.low
             out.append(self._record(RecordKind.FEATURE, FeatureType.SWING_LOW,
                                     candidate.observed_at, at, sd,
@@ -497,6 +497,15 @@ class FeatureEngine:
         """
         out = []
         sd = self.calendar.session_date_for(bar.observed_at)
+        # INVERSION IS TERMINAL. `inverted` is set once and never
+        # cleared, and the first thing this loop does with such a gap is
+        # skip it -- so an inverted gap can never produce another record.
+        # Keeping them made this loop O(all gaps ever formed) on EVERY
+        # bar: at 1,234 sessions roughly 196,000 dead objects rescanned
+        # 1.7M times, which is the engine's whole quadratic term.
+        # Survivors are collected during the pass already being made, so
+        # dropping them costs nothing and changes no output.
+        survivors: List[_FVG] = []
         for gap in self._open_fvgs:
             if gap.inverted:
                 continue
@@ -512,4 +521,7 @@ class FeatureEngine:
                     out.append(self._event(EventType.FVG_INVERTED, at, at, sd,
                                            value=bar.close, direction=gap.direction,
                                            top=gap.top, bottom=gap.bottom))
+            if not gap.inverted:
+                survivors.append(gap)
+        self._open_fvgs = survivors
         return out

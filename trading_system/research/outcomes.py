@@ -27,9 +27,34 @@ DIRECTION IS SUPPLIED, NEVER INFERRED
 that is declared at pre-registration. Choosing the direction after
 seeing the path would double the effective number of tests while
 appearing to be one.
+
+HOW THE WINDOW IS FOUND, AND WHY THAT IS THE ONLY THING THE INDEX
+CHANGES
+
+Selecting the bars after an event by scanning the whole series is
+O(events x bars). Measured on synthetic sessions of the real shape, the
+twelve hypotheses took 64 s over ten sessions and grew quadratically:
+about eleven days at 1,234. The fix is a sorted index over bar CLOSE
+times, so the window is found by bisection instead of by scanning.
+
+The index is deliberately confined to `_select_window`. Everything that
+computes a number -- the reference price, the excursions, their times,
+the truncation flag -- runs on the selected bars in code that both
+paths share, so an indexed run and a scanning run cannot drift in what
+they measure, only in how the same slice is located. `tests/
+test_equivalence.py` asserts the two produce identical ForwardPath
+values.
+
+The index answers "where", never "what". It is built from the same bars
+already passed in, exposes only positions, and the slice it returns is
+the same slice the scan returns -- so it can no more see past the
+horizon than the comprehension it replaces. When the close times are
+not sorted the index reports itself unusable and the scan runs, which
+is why the fast path never has to ASSUME monotonicity.
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -135,30 +160,95 @@ class PathScanner:
         return "neither", None
 
 
-def measure_forward_path(event_type: str, event_at: datetime,
-                         bars: Sequence[Bar], horizon_minutes: int
-                         ) -> Optional[Tuple[ForwardPath, PathScanner]]:
-    """Measure what followed an event.
+class BarWindowIndex:
+    """Bar CLOSE times, sorted, for locating a forward window by bisection.
+
+    Positions only. This class never looks at a price, so no arrangement
+    of it could leak a future value into a measurement.
+
+    `monotonic` is CHECKED at construction rather than assumed. Bars are
+    ordered by `observed_at` and `closed_at` adds each bar's own
+    interval, so a series mixing intervals could close out of order. When
+    that happens the index declares itself unusable and callers fall back
+    to scanning, which is correct at any ordering.
+    """
+
+    __slots__ = ("bars", "_closes", "monotonic")
+
+    def __init__(self, bars: Sequence[Bar]):
+        self.bars = bars
+        self._closes = [b.closed_at for b in bars]
+        self.monotonic = all(a <= b for a, b in
+                             zip(self._closes, self._closes[1:]))
+
+    def usable_for(self, bars: Sequence[Bar]) -> bool:
+        """An index describes ONE sequence. Applying it to another would
+        silently measure the wrong window, so identity is required."""
+        return self.monotonic and bars is self.bars
+
+    def first_closing_at_or_after(self, when: datetime) -> int:
+        return bisect_left(self._closes, when)
+
+    def count_closing_at_or_before(self, when: datetime) -> int:
+        return bisect_right(self._closes, when)
+
+
+def _select_window(bars: Sequence[Bar], event_at: datetime,
+                   horizon_minutes: int, index: Optional[BarWindowIndex]):
+    """(reference_bar, path), or None. THE ONLY INDEXED STEP.
 
     NO LOOKAHEAD: the reference is the close of the first bar that CLOSES
     at or after the event became available, and only bars from that point
     forward are considered. Using the event bar's own open, or a bar that
     was still forming, would import information the event did not have.
+    """
+    if index is None or not index.usable_for(bars):
+        actionable = [b for b in bars if b.closed_at >= event_at]
+        if not actionable:
+            return None
+        reference_bar = actionable[0]
+        window_end = reference_bar.closed_at + timedelta(minutes=horizon_minutes)
+        # Strictly AFTER the reference bar: the reference close is the
+        # price you got, not part of the path you then experienced.
+        return reference_bar, [b for b in actionable[1:]
+                               if b.closed_at <= window_end]
+
+    # Monotonic closes make both filters contiguous ranges:
+    #   {b : close >= event_at}          == bars[start:]
+    #   {b in bars[start+1:] : close <= end} == bars[start+1:stop]
+    # because once a close exceeds `end` every later one does too.
+    start = index.first_closing_at_or_after(event_at)
+    if start >= len(bars):
+        return None
+    reference_bar = bars[start]
+    window_end = reference_bar.closed_at + timedelta(minutes=horizon_minutes)
+    # horizon_minutes > 0, so the reference bar's own close is inside the
+    # window and stop is at least start + 1: the slice can be empty but
+    # never inverted.
+    stop = index.count_closing_at_or_before(window_end)
+    return reference_bar, list(bars[start + 1:stop])
+
+
+def measure_forward_path(event_type: str, event_at: datetime,
+                         bars: Sequence[Bar], horizon_minutes: int,
+                         index: Optional[BarWindowIndex] = None
+                         ) -> Optional[Tuple[ForwardPath, PathScanner]]:
+    """Measure what followed an event.
+
+    `index` only changes how the window is located; pass None and the
+    result is identical, just slower.
 
     Returns None when no actionable bar exists after the event.
     """
     if horizon_minutes <= 0:
         raise OutcomeError("horizon must be positive")
 
-    actionable = [b for b in bars if b.closed_at >= event_at]
-    if not actionable:
+    selected = _select_window(bars, event_at, horizon_minutes, index)
+    if selected is None:
         return None
-    reference_bar = actionable[0]
+    reference_bar, path = selected
     reference_price = reference_bar.close
     window_end = reference_bar.closed_at + timedelta(minutes=horizon_minutes)
-    # Strictly AFTER the reference bar: the reference close is the price
-    # you got, not part of the path you then experienced.
-    path = [b for b in actionable[1:] if b.closed_at <= window_end]
 
     if not path:
         return ForwardPath(

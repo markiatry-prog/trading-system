@@ -183,6 +183,16 @@ def main() -> int:
     f.check(not empty, "no zero-byte study outputs",
             ", ".join(str(p) for p in empty) if empty else "none found")
 
+    # A completed run deletes its own checkpoint as its last act. One
+    # left next to a report means the report and the checkpoint describe
+    # different runs, or the run died after writing the report -- either
+    # way the pair should not be trusted without looking.
+    leftover = sorted(Path(".").glob("*.checkpoint.json"))
+    f.check(not leftover, "no leftover checkpoint",
+            (f"{', '.join(str(p) for p in leftover)} -- a finished run "
+             f"removes its checkpoint, so this run did not finish")
+            if leftover else "none found")
+
     # -- 6. dataset and manifest integrity ------------------------------
     print("\n6. DATASET AND MANIFEST INTEGRITY")
     manifest_path = data_dir / "manifest.json"

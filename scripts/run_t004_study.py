@@ -15,6 +15,29 @@ Order is fixed and cannot be shuffled:
 The final holdout is NOT opened by this script. Opening it is a separate,
 deliberate act after the hypothesis set is final -- `--unseal-holdout`
 exists, demands a reason, and records it permanently.
+
+RESUMABLE. Each non-holdout stage is checkpointed as it completes, so a
+reboot costs the current stage rather than the whole run -- which it
+twice did. The checkpoint carries a digest of everything that
+determines the output (dataset, symbol, engine, config, hypothesis
+structure, quality verdict, partitions, and the source of every module
+that computes a number) and refuses to resume if any of it moved. The
+holdout is never written to one. See research/checkpoint.py.
+
+WHY IT USED TO TAKE DAYS. Two quadratic terms, both invisible:
+
+  measure_forward_path rebuilt the list of bars after an event by
+  scanning the whole stage, once per event -- O(events x bars).
+
+  condition_state scanned every feature record to answer each
+  conditioning question -- O(events x features).
+
+Measured on synthetic sessions of the real shape, the twelve
+hypotheses cost 64 s over ten sessions and 251 s over twenty: a
+four-fold rise for a doubling, extrapolating to about eleven days at
+1,234. Both are now located by bisection over a sorted index, and the
+engine no longer rescans FVGs that can never fire again. The numbers
+are unchanged and tests/test_equivalence.py is the evidence.
 """
 from __future__ import annotations
 
@@ -23,6 +46,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -31,13 +55,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trading_system.features.config import FeatureConfig
 from trading_system.features.contracts import ContractTimeline
-from trading_system.features.engine import FeatureEngine
+from trading_system.features.engine import ENGINE_VERSION, FeatureEngine
 from trading_system.market_data import Instrument
+from trading_system.research.checkpoint import (
+    CHECKPOINT_VERSION, CheckpointError, CheckpointKey, StudyCheckpoint,
+    code_digest, partition_digest, quality_digest,
+    registry_structure_digest)
 from trading_system.research.classify import Verdict
+from trading_system.research.outcomes import BarWindowIndex
 from trading_system.research.partitions import Partition, split_chronologically
 from trading_system.research.preregistered import build_registry
-from trading_system.research.quality import QualityReport, assess_day
-from trading_system.research.study import Study
+from trading_system.research.progress import StageProgress, format_duration
+from trading_system.research.quality import (QualityReport, QualityThresholds,
+                                             assess_day)
+from trading_system.research.study import (FeatureStateIndex, Study,
+                                           required_condition_types)
 from trading_system.sources.databento_source import DatabentoFileSource
 
 INSTRUMENTS = {
@@ -65,6 +97,30 @@ def verify_manifest(data_dir: Path) -> dict:
     return manifest
 
 
+def load_or_start(path: Path, key: CheckpointKey,
+                  restart: bool) -> StudyCheckpoint:
+    """Resume, or refuse and say why. Never silently discard.
+
+    A checkpoint written under different inputs is not merely useless --
+    resuming from it would splice results computed under one version of
+    the code or the data into a report describing another. So a mismatch
+    stops the run and names what changed; discarding it has to be the
+    operator's explicit choice.
+    """
+    if restart and path.exists():
+        path.unlink()
+        print(f"   --restart: discarded {path}")
+    if not path.exists():
+        return StudyCheckpoint(key=key)
+    try:
+        return StudyCheckpoint.load(path, key)
+    except CheckpointError as exc:
+        raise SystemExit(
+            f"\nCHECKPOINT REFUSED\n  {path}\n  {exc}\n\n"
+            f"  Rerun with --restart to discard it and compute from the "
+            f"beginning.\n") from None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data/t004")
@@ -74,6 +130,14 @@ def main() -> int:
                          "reason, recorded permanently. Do NOT use while "
                          "developing or selecting hypotheses.")
     ap.add_argument("--out", default=None, help="write the full report as JSON")
+    ap.add_argument("--checkpoint", default=None,
+                    help="checkpoint file (default: <out>.checkpoint.json, "
+                         "or t004-<symbol>.checkpoint.json). Completed "
+                         "stages are reloaded instead of recomputed.")
+    ap.add_argument("--restart", action="store_true",
+                    help="discard an existing checkpoint and start over. "
+                         "Required to proceed when a checkpoint exists but "
+                         "was written under different inputs.")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -188,9 +252,52 @@ def main() -> int:
         stages.append(Partition.HOLDOUT)
         print(f"\n   HOLDOUT UNSEALED: {args.unseal_holdout}")
 
+    # -- checkpoint --------------------------------------------------
+    # The key digests everything that determines the output. Resuming
+    # under anything else is refused, not reconciled.
+    key = CheckpointKey(
+        checkpoint_version=CHECKPOINT_VERSION,
+        study_version=study.provenance()["study_version"],
+        engine_version=ENGINE_VERSION,
+        symbol=args.symbol,
+        dataset_sha256=manifest["sha256"],
+        dataset_bytes=int(manifest["bytes"]),
+        request_digest=str(manifest.get("request_digest", "")),
+        config_digest=config.digest(),
+        config_name=config.name,
+        registry_structure=registry_structure_digest(registry),
+        quality=quality_digest(QualityThresholds(), usable),
+        partitions=partition_digest(parts),
+        code=code_digest(),
+    )
+    ckpt_path = Path(args.checkpoint or (
+        (args.out + ".checkpoint.json") if args.out
+        else f"t004-{args.symbol}.checkpoint.json"))
+    checkpoint = load_or_start(ckpt_path, key, args.restart)
+
+    print(f"\n5b. checkpoint {ckpt_path}")
+    print(f"    key {key.digest()[:32]}")
+    if checkpoint.completed():
+        print(f"    RESUMING -- already complete: "
+              f"{', '.join(checkpoint.completed())}")
+    else:
+        print("    no reusable stage; starting from the first")
+
     print()
+    required_features = required_condition_types(registry)
+    print(f"6. stages  (conditioning reads {sorted(required_features) or 'no'} "
+          f"feature types; the rest are not retained)")
+    run_started = time.perf_counter()
     for stage in stages:
         days = parts.select(usable, stage)
+        if checkpoint.has(stage):
+            n = checkpoint.restore_into(study, stage)
+            done = checkpoint.stages[stage.value]
+            print(f"   {stage.value:11} {len(days):>4} days  "
+                  f"{done['events']:>8,} events  RESTORED from checkpoint "
+                  f"({n} results, completed {done['completed_at'][11:19]})")
+            continue
+
         # ONE engine, fed the whole stage in order. A fresh engine per
         # day never carries a prior-day level forward, so
         # _detect_sweeps could not fire on any reference and H6/H7 had
@@ -204,14 +311,44 @@ def main() -> int:
         # first day of each stage has no prior session, which the
         # contract rule already reports as no_prior_session.
         engine = FeatureEngine(instrument, config)
-        events, features, stage_bars = [], [], []
+        # Features are indexed as they stream out rather than collected.
+        # The engine emits ~17 per bar and conditioning reads one of
+        # them, so keeping the list would hold ~30M records to consult
+        # ~2M -- which is what exhausted the machine.
+        conditions = FeatureStateIndex(required_features)
+        events, stage_bars = [], []
+        progress = StageProgress(stage.value, len(days))
+        if checkpoint.completed():
+            # Only a checkpoint that actually holds a stage; a freshly
+            # constructed one has a timestamp but nothing behind it.
+            progress.note_checkpoint(checkpoint.updated_at)
         for day in days:
+            before = len(events)
             for record in engine.run(by_day[day]):
-                (events if record.kind.value == "event" else features).append(record)
+                if record.kind.value == "event":
+                    events.append(record)
+                else:
+                    conditions.add(record)
             stage_bars.extend(by_day[day])
+            progress.advance(len(by_day[day]), len(events) - before)
+        bar_index = BarWindowIndex(stage_bars)
         for h in registry.all():
-            study.test(h.id, stage, events, features, stage_bars)
-        print(f"6. {stage.value:11} {len(days):>4} days  {len(events):>7} events")
+            study.test(h.id, stage, events, (), stage_bars,
+                       bar_index=bar_index, condition_index=conditions)
+        elapsed = progress.finish()
+
+        if stage is Partition.HOLDOUT:
+            print(f"   {stage.value:11} not checkpointed by design")
+        else:
+            stage_results = [r for r in study.results
+                             if r.partition == stage.value]
+            checkpoint.record_stage(stage, stage_results, study.ledger,
+                                    len(days), len(events))
+            checkpoint.save(ckpt_path)
+            progress.note_checkpoint(checkpoint.updated_at)
+            print(f"   {stage.value:11} done in {format_duration(elapsed)}; "
+                  f"checkpoint saved {checkpoint.updated_at[11:19]}")
+    print(f"   total stage time {format_duration(time.perf_counter() - run_started)}")
 
     print("\n7. verdicts (Benjamini-Hochberg corrected across discovery)\n")
     verdicts = study.classify_all()
@@ -275,6 +412,13 @@ def main() -> int:
             os.fsync(handle.fileno())      # durable before the rename
         os.replace(tmp, out_path)          # atomic on Windows and POSIX
         print(f"\nfull report written to {args.out} ({len(payload):,} bytes)")
+
+    # The report is complete, so the checkpoint has nothing left to
+    # resume. Removing it last means a crash before this point still
+    # leaves the work recoverable.
+    if ckpt_path.exists():
+        ckpt_path.unlink()
+        print(f"checkpoint {ckpt_path} removed; the run completed")
     return 0
 
 

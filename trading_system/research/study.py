@@ -28,10 +28,11 @@ claim at all, so it is removed before anything is measured. See
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..market_data import Bar
 from ..provenance import digest, utcnow
@@ -42,7 +43,8 @@ from .eligibility import EligibilityReport, filter_eligible
 from .hypotheses import Direction, Hypothesis, HypothesisRegistry
 from .inference import Estimate, bootstrap_mean, two_sided_p
 from .multiplicity import SnoopingLedger, benjamini_hochberg
-from .outcomes import ForwardPath, PathScanner, measure_forward_path
+from .outcomes import (BarWindowIndex, ForwardPath, PathScanner,
+                       measure_forward_path)
 from .partitions import ChronologicalPartitions, Partition
 from .quality import QualityReport
 
@@ -53,14 +55,110 @@ class StudyError(Exception):
     pass
 
 
+def _resolved_state(record: FeatureRecord) -> Optional[str]:
+    """The single definition of what a record's state IS.
+
+    Shared by the scanning and the indexed lookup so the two cannot
+    disagree about a record they both selected.
+    """
+    return record.state if record.state is not None else (
+        None if record.value is None else str(record.value))
+
+
+def required_condition_types(registry: HypothesisRegistry) -> Set[str]:
+    """Every feature type any registered hypothesis conditions on.
+
+    Derived from the registry, never listed. Conditioning is the ONLY
+    thing the study does with feature records, so a record whose type is
+    not in this set can never be examined -- which is what makes it safe
+    for a caller to keep just these and drop the rest. The frozen set
+    conditions on one feature; the engine emits about seventeen per bar,
+    so this is the difference between ~2M records and ~30M.
+    """
+    out: Set[str] = set()
+    for h in registry.all():
+        out.update(h.conditions)
+    return out
+
+
+class FeatureStateIndex:
+    """Condition states by type, in arrival order, for lookup by bisection.
+
+    Scanning every feature record per event is O(events x features) and
+    is the second of the two quadratic terms that made the real run
+    unfinishable.
+
+    BUILT INCREMENTALLY AND NARROWLY. `add` keeps a record only when its
+    type is one the registry actually conditions on, and keeps only the
+    two things a lookup reads -- the availability time and the resolved
+    state. The FeatureRecord itself is not retained, so the engine's
+    output can be consumed as a stream instead of accumulated.
+
+    `usable` is CHECKED, not assumed: availability times must be
+    non-decreasing within a type for bisection to be equivalent to the
+    scan. They are, because the engine processes bars in order and
+    stamps availability at bar close -- but a caller feeding records out
+    of order gets the scan, not a wrong answer.
+    """
+
+    __slots__ = ("_wanted", "_times", "_states", "usable")
+
+    def __init__(self, wanted: Iterable[str]):
+        self._wanted = frozenset(wanted)
+        self._times: Dict[str, List[datetime]] = {}
+        self._states: Dict[str, List[Optional[str]]] = {}
+        self.usable = True
+
+    def add(self, record: FeatureRecord) -> bool:
+        """Returns whether the record was kept, for reconciliation."""
+        if record.type not in self._wanted:
+            return False
+        times = self._times.setdefault(record.type, [])
+        if times and record.available_at < times[-1]:
+            # Out of order: bisection would no longer match the scan.
+            self.usable = False
+        times.append(record.available_at)
+        self._states.setdefault(record.type, []).append(_resolved_state(record))
+        return True
+
+    def extend(self, records: Iterable[FeatureRecord]) -> int:
+        return sum(1 for r in records if self.add(r))
+
+    def state_at(self, feature_type: str, at: datetime) -> Optional[str]:
+        times = self._times.get(feature_type)
+        if not times:
+            return None
+        i = bisect_right(times, at) - 1
+        if i < 0:
+            return None
+        # The scan keeps the FIRST record among equal availability times
+        # (its comparison is strictly greater-than), so walk back over
+        # any tie to select the same one. Ties cannot occur for a
+        # per-bar feature, but matching the scan exactly costs nothing
+        # and removes the need to argue that they cannot.
+        while i > 0 and times[i - 1] == times[i]:
+            i -= 1
+        return self._states[feature_type][i]
+
+    def summary(self) -> dict:
+        return {"types": sorted(self._times),
+                "records": sum(len(v) for v in self._times.values()),
+                "usable": self.usable}
+
+
 def condition_state(records: Sequence[FeatureRecord], feature_type: str,
-                    at: datetime) -> Optional[str]:
+                    at: datetime,
+                    index: Optional[FeatureStateIndex] = None) -> Optional[str]:
     """The state of a feature as it was KNOWN at `at`.
 
     Filters on available_at, never effective_at. A swing high that
     occurred before `at` but was not confirmed until after it is
     correctly invisible here.
+
+    `index` changes only how the record is found; the answer is the same.
     """
+    if index is not None and index.usable:
+        return index.state_at(feature_type, at)
     best: Optional[FeatureRecord] = None
     for r in records:
         if r.type != feature_type or r.available_at > at:
@@ -69,14 +167,14 @@ def condition_state(records: Sequence[FeatureRecord], feature_type: str,
             best = r
     if best is None:
         return None
-    return best.state if best.state is not None else (
-        None if best.value is None else str(best.value))
+    return _resolved_state(best)
 
 
 def matches(records: Sequence[FeatureRecord], conditions: Dict[str, str],
-            at: datetime) -> bool:
+            at: datetime,
+            index: Optional[FeatureStateIndex] = None) -> bool:
     for feature_type, required in conditions.items():
-        if condition_state(records, feature_type, at) != required:
+        if condition_state(records, feature_type, at, index) != required:
             return False
     return True
 
@@ -122,6 +220,13 @@ class Study:
     # prior-session comparison as within-contract, so every such
     # hypothesis reports zero eligible events and says why.
     contracts: Optional[ContractTimeline] = None
+    # Build the bar index when a caller does not supply one. Set False
+    # to force the scanning path. That exists so the unoptimized code is
+    # REACHABLE: a benchmark whose reference arm quietly took the fast
+    # path would report a speedup of 1.1x, and an equivalence test
+    # written the same way would compare the fast path against itself.
+    # Both happened before this flag did.
+    accelerate: bool = True
     ledger: SnoopingLedger = field(default_factory=SnoopingLedger)
     results: List[HypothesisResult] = field(default_factory=list)
     started_at: str = field(default_factory=lambda: utcnow().isoformat())
@@ -130,12 +235,21 @@ class Study:
              events: Sequence[FeatureRecord],
              features: Sequence[FeatureRecord],
              bars: Sequence[Bar],
-             exploratory: bool = False) -> HypothesisResult:
+             exploratory: bool = False,
+             bar_index: Optional[BarWindowIndex] = None,
+             condition_index: Optional[FeatureStateIndex] = None
+             ) -> HypothesisResult:
         """Run one hypothesis against one partition.
 
         Every call is counted in the snooping ledger, exploratory or not.
         A ledger that counted only reported tests would relocate the
         self-deception rather than remove it.
+
+        The two indexes are pure accelerators: omit them and the same
+        numbers come out of the same code, located by scanning. A caller
+        that passes `condition_index` may pass `features=()` with it,
+        because the index already holds every record conditioning could
+        have read.
         """
         if not self.registry.sealed:
             raise StudyError(
@@ -156,12 +270,16 @@ class Study:
         fav_first: List[bool] = []
         matched = 0
 
+        if bar_index is None and self.accelerate:
+            bar_index = self._bar_index_for(bars)
         for event in candidates:
-            if h.conditions and not matches(features, h.conditions, event.available_at):
+            if h.conditions and not matches(features, h.conditions,
+                                            event.available_at, condition_index):
                 continue
             matched += 1
             measured = measure_forward_path(
-                h.event_type, event.available_at, bars, h.horizon_minutes)
+                h.event_type, event.available_at, bars, h.horizon_minutes,
+                bar_index)
             if measured is None:
                 continue
             path, _scanner = measured
@@ -192,6 +310,20 @@ class Study:
         )
         self.results.append(result)
         return result
+
+    def _bar_index_for(self, bars: Sequence[Bar]) -> BarWindowIndex:
+        """One index per bar sequence, reused across the twelve tests.
+
+        The memo holds the sequence itself, not just its id, so the
+        object cannot be collected and its id handed to a different
+        sequence while the memo still claims to describe it.
+        """
+        cached = getattr(self, "_bar_index_memo", None)
+        if cached is not None and cached.bars is bars:
+            return cached
+        index = BarWindowIndex(bars)
+        self._bar_index_memo = index
+        return index
 
     def classify_all(self, fdr: float = 0.05) -> Dict[str, Classification]:
         """Correct across every test run, then classify each hypothesis."""
