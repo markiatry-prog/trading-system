@@ -18,6 +18,13 @@ untouched and this module adds a second, orthogonal digest beside it:
   the CHAIN answers   "was this set tampered with after registration?"
   the IDENTITY answers "is this the same research design?"
 
+`analysis_version` and `baseline` keep separate analyses of the same
+data separate. T-004 asked whether the post-event return differs from
+zero; T-004B asks whether it differs from a matched control. Same
+hypotheses, same dataset, different question -- so a different identity,
+and a T-004 checkpoint that a T-004B run could resume would silently
+mix the two.
+
 WHAT COUNTS AS MEANING. Everything that could change a number in the
 report, and nothing that could not:
 
@@ -70,7 +77,8 @@ COMPUTING_MODULES = (
     "features/calendar.py", "features/config.py", "features/contracts.py",
     "features/engine.py", "features/records.py", "features/roll.py",
     "market_data.py",
-    "research/classify.py", "research/eligibility.py",
+    "research/baseline.py", "research/classify.py",
+    "research/eligibility.py",
     "research/hypotheses.py", "research/identity.py",
     "research/inference.py", "research/multiplicity.py",
     "research/outcomes.py", "research/partitions.py",
@@ -178,6 +186,14 @@ def dataset_digest(sha256: str, byte_count: int, request_digest: str) -> str:
 class ResearchIdentity:
     """One digest for one research design. Stable across processes."""
     semantic_version: str
+    # Which analysis this is. T-004 tested against zero; T-004B adds a
+    # matched baseline. They are different questions asked of the same
+    # data, so they must not share an identity -- and a T-004 checkpoint
+    # must never be resumable by a T-004B run.
+    analysis_version: str
+    # The matching specification, or "none" for an analysis that has no
+    # control arm. A different matching rule is a different comparison.
+    baseline: str
     study_version: str
     engine_version: str
     symbol: str
@@ -196,10 +212,13 @@ class ResearchIdentity:
               feature_config, registry: HypothesisRegistry,
               thresholds, passed_days: Sequence[date], partitions,
               dataset_sha256: str, dataset_bytes: int,
-              request_digest: str,
+              request_digest: str, analysis_version: str = "T-004",
+              baseline_digest: str = "none",
               package_root: Optional[Path] = None) -> "ResearchIdentity":
         return cls(
             semantic_version=SEMANTIC_DIGEST_VERSION,
+            analysis_version=analysis_version,
+            baseline=baseline_digest,
             study_version=study_version,
             engine_version=engine_version,
             symbol=symbol,

@@ -171,7 +171,12 @@ class StudyCheckpoint:
     def record_stage(self, partition: Partition,
                      results: Sequence[HypothesisResult],
                      ledger: SnoopingLedger,
-                     sessions: int, events: int) -> None:
+                     sessions: int, events: int,
+                     rows: Optional[Sequence[dict]] = None) -> None:
+        """`rows` carries an analysis's own per-stage output -- T-004B's
+        baseline comparisons -- alongside the hypothesis results, so a
+        second analysis gets the same atomicity, key checking and
+        holdout refusal without a second checkpoint format."""
         if partition is Partition.HOLDOUT:
             raise CheckpointError(
                 "refusing to checkpoint the holdout. A sealed partition "
@@ -180,11 +185,16 @@ class StudyCheckpoint:
                 "and an iterated one.")
         self.stages[partition.value] = {
             "results": [_result_to_json(r) for r in results],
+            "rows": list(rows) if rows else [],
             "sessions": sessions, "events": events,
             "completed_at": utcnow().isoformat(),
         }
         self.ledger_entries = [dict(e) for e in ledger.entries]
         self.updated_at = utcnow().isoformat()
+
+    def rows_for(self, partition: Partition) -> List[dict]:
+        stage = self.stages.get(partition.value)
+        return list(stage.get("rows", [])) if stage else []
 
     def results_for(self, partition: Partition) -> List[HypothesisResult]:
         stage = self.stages.get(partition.value)

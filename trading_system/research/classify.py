@@ -11,6 +11,28 @@ reach; both are successful outcomes. An adequately powered null is a
 real finding: it removes a candidate. INCONCLUSIVE is an admission that
 the study could not answer the question, which is different from
 answering it in the negative and must never be written up as such.
+
+THREE OUTCOMES, NOT TWO. `signed_return` is oriented so that positive
+means the PREREGISTERED hypothesis was right. So the sign of the
+interval carries meaning that "excludes zero" throws away:
+
+  interval materially ABOVE zero   the predicted effect may be supported
+  interval CROSSING zero           no supported effect
+  interval materially BELOW zero   the market moved reliably AGAINST the
+                                   prediction
+
+This module used to test only `excludes_zero`, so the third case
+reached PROMISING: a hypothesis that was reliably WRONG was reported as
+a promising confirmation. It is now OPPOSITE_EFFECT.
+
+WHY OPPOSITE_EFFECT IS NOT A WIN. "The reverse is true" is a real
+finding and worth keeping, but it is not evidence for the reversed
+strategy, because the reversed hypothesis was never preregistered. It
+was selected by looking at the data -- which is exactly the search this
+whole framework exists to prevent from masquerading as a test. An
+OPPOSITE_EFFECT is therefore an EXPLORATORY CANDIDATE for a future
+cycle: it must be written down, frozen, and validated on data it has
+never touched before it counts as anything.
 """
 from __future__ import annotations
 
@@ -26,6 +48,9 @@ class Verdict(str, Enum):
     INCONCLUSIVE = "inconclusive"  # the study could not answer it
     PROMISING = "promising"        # survived discovery, not yet confirmed
     ROBUST = "robust"              # survived discovery, validation and holdout
+    # Reliably wrong in the direction it declared. NOT a confirmation of
+    # the reverse: that claim was never preregistered.
+    OPPOSITE_EFFECT = "opposite_effect"
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,29 @@ def classify(discovery: Optional[Estimate],
             Verdict.REJECT,
             "significant before correction but not after; with the number of "
             "tests actually run, this is the result expected by chance")
+
+    # Checked AFTER multiplicity, so a spurious reversal is reported as
+    # the noise it is rather than announced as a discovery.
+    if discovery.ci_high < 0:
+        agreement = ""
+        if validation is not None and validation.n >= min_n:
+            agreement = (
+                " The validation period agrees in sign."
+                if validation.ci_high < 0 else
+                " The validation period does NOT agree, so even the reversal "
+                "is unstable.")
+        return Classification(
+            Verdict.OPPOSITE_EFFECT,
+            f"adequately powered (n={discovery.n}) and the confidence "
+            f"interval [{discovery.ci_low:.3f}, {discovery.ci_high:.3f}] lies "
+            f"entirely BELOW zero. The market moved reliably AGAINST the "
+            f"preregistered direction.{agreement} This is a finding, not a "
+            f"confirmation of the reverse strategy: that hypothesis was never "
+            f"preregistered, and treating it as tested would be exactly the "
+            f"post-hoc selection this framework exists to prevent. Record it "
+            f"as an exploratory candidate, freeze it, and validate it on data "
+            f"it has not seen.",
+            tradable=tradable)
 
     if validation is None:
         return Classification(
