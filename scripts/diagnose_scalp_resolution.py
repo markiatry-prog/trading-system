@@ -1,26 +1,43 @@
 #!/usr/bin/env python3
 """Can 1-minute bars resolve a seconds-to-minutes scalp? A diagnostic.
 
-NOT RESEARCH. This measures the DATA, not the market, and answers one
-question: is a 5-15 point move completed within a minute visible at all
-in one-minute OHLCV, or does it happen inside a bar where the ordering
-of high and low is unknowable?
+NOT RESEARCH, AND NOT A SELECTION. This measures the DATA, not the
+market. It answers one question -- which bracket and horizon
+combinations one-minute OHLCV can actually adjudicate -- and it must not
+be used to pick the bracket or horizon that shows the nicest
+directional result. Doing so would choose a research parameter from an
+outcome, which is the mining this whole framework exists to prevent.
+The directional split is printed because it is the null any future
+edge must beat, not because the largest one is interesting.
 
-WHY IT MATTERS MORE THAN ANY RESULT SO FAR. Every horizon tested to
-date is 15 to 60 minutes. A trade held for seconds to a minute lives
-inside a single bar of this dataset. If most one-minute bars already
-span the trade's whole target, then bar data cannot say whether the
-favourable level or the adverse one came first -- and a study built on
-it would be answering with a coin flip while reporting a number.
+THE TWO WAYS THIS DATA CAN FAIL, KEPT SEPARATE
 
-TWO MEASUREMENTS
+  AMBIGUITY     both sides of the bracket touched inside ONE bar. The
+                order is then unknowable from OHLCV, and a study of
+                that bracket is guessing on that share of its sample.
+                This is a RESOLUTION limit -- finer data would fix it.
+  REACHABILITY  neither side touched before the horizon expires. That
+                is a fact about the market, not the data: a finer feed
+                would report the same non-event. A bracket can be
+                perfectly measurable and still rarely reached.
 
-  1. The distribution of one-minute RTH bar ranges. If the median bar
-     spans more than the target, the target is an intrabar event.
-  2. For symmetric brackets, how often BOTH sides are touched within
-     one bar. That is the `same_bar` outcome the path scanner already
-     refuses to adjudicate, and its frequency is the resolution limit
-     expressed directly.
+Conflating them would let a market fact masquerade as a data problem,
+or the reverse.
+
+FIRST TOUCH IS REPORTED TWICE
+
+  conservative  same-bar counted as a failure. In live trading a minute
+                that trades through both levels is a minute you were
+                probably stopped, so this is the honest default.
+  diagnostic    same-bar excluded. Shows what the resolvable subset did,
+                and by how much the ambiguity is flattering the result.
+
+THE SESSION IS SPLIT, because the operator trades one window
+
+  A  09:30-10:50 ET   the first 80 minutes of RTH, taken from the
+                      calendar's own open so it stays correct across
+                      daylight saving
+  B  rest of RTH
 
 Discovery partition only. Reads no validation and no holdout.
 """
@@ -31,7 +48,7 @@ import hashlib
 import json
 import statistics
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -53,18 +70,28 @@ INSTRUMENTS = {
     "ES.c.0": Instrument(symbol="ES.c.0", product="ES", tick_size=Decimal("0.25")),
 }
 
-BRACKETS = [Decimal(x) for x in ("2.5", "5", "7.5", "10", "15", "20", "30")]
-HORIZON_MINUTES = 5
-SAMPLE_STRIDE = 7          # every 7th RTH bar; deterministic, ample
+BRACKETS = [Decimal(x) for x in ("5", "7.5", "10", "15", "20")]
+HORIZONS = (1, 2, 3, 5)
+OPENING_WINDOW_MINUTES = 80          # 09:30 -> 10:50 ET
+SAMPLE_STRIDE = 3
+
+# Declared before the run, so a verdict is a rule rather than a reading.
+MAX_AMBIGUITY_SHARE = 0.05           # above this, resolution-limited
+LOW_REACHABILITY_SHARE = 0.25        # below this, rarely reached
 
 
 def verify_manifest(data_dir: Path) -> dict:
     manifest = json.loads((data_dir / "manifest.json").read_text())
-    dbn = data_dir / manifest["file"]
-    actual = hashlib.sha256(dbn.read_bytes()).hexdigest()
+    actual = hashlib.sha256((data_dir / manifest["file"]).read_bytes()).hexdigest()
     if actual != manifest["sha256"]:
         raise SystemExit(f"INTEGRITY FAILURE on {manifest['file']}")
     return manifest
+
+
+def percentiles(values, points=(10, 25, 50, 75, 90, 99)):
+    ordered = sorted(values)
+    return {str(p): ordered[min(len(ordered) - 1, int(len(ordered) * p / 100))]
+            for p in points}
 
 
 def main() -> int:
@@ -76,8 +103,10 @@ def main() -> int:
     ap.add_argument("--out", default="scalp_resolution.json")
     args = ap.parse_args()
 
-    print("SCALP RESOLUTION DIAGNOSTIC")
-    print("Measures the DATA, not the market. Discovery partition only.\n")
+    print("SCALP RESOLUTION AND REACHABILITY DIAGNOSTIC")
+    print("Measures the DATA, not the market. Discovery partition only.")
+    print("Not a selection: do NOT pick a bracket or horizon from the")
+    print("directional columns below.\n")
 
     data_dir = Path(args.data_dir)
     manifest = verify_manifest(data_dir)
@@ -86,8 +115,7 @@ def main() -> int:
                                  datetime.fromisoformat(manifest["finished_at"]))
     print("1. manifest verified; resolving symbology ...")
     bars = source.bars_by_symbol()[instrument.symbol]
-    config = FeatureConfig()
-    calendar = FeatureEngine(instrument, config).calendar
+    calendar = FeatureEngine(instrument, FeatureConfig()).calendar
 
     by_day = {}
     for b in bars:
@@ -100,80 +128,145 @@ def main() -> int:
     print(f"2. discovery ONLY: {len(days)} sessions "
           f"({days[0]} .. {days[-1]})\n")
 
-    rth = []
+    # -- split the session ------------------------------------------
+    windows = {"A": [], "B": []}
     for day in days:
         opened = calendar.rth_open_at(day)
         closed = calendar.rth_close_at(day)
-        rth.extend(b for b in by_day[day] if opened <= b.observed_at < closed)
-    ranges = sorted(float(b.high - b.low) for b in rth)
-    print(f"3. ONE-MINUTE RTH BAR RANGES  ({len(ranges):,} bars)\n")
-    for pct in (10, 25, 50, 75, 90, 99):
-        value = ranges[min(len(ranges) - 1, int(len(ranges) * pct / 100))]
-        print(f"   {pct:>3}th percentile   {value:>8.2f} points")
-    print(f"   mean              {statistics.mean(ranges):>8.2f} points\n")
-    print("   fraction of bars whose range already spans a target of:")
-    for target in BRACKETS:
-        t = float(target)
-        share = sum(1 for r in ranges if r >= t) / len(ranges)
-        note = "  <-- your target range" if 5 <= t <= 15 else ""
-        print(f"     {t:>5.1f} points   {share:>6.1%}{note}")
+        cutoff = opened + timedelta(minutes=OPENING_WINDOW_MINUTES)
+        for b in by_day[day]:
+            if opened <= b.observed_at < cutoff:
+                windows["A"].append(b)
+            elif cutoff <= b.observed_at < closed:
+                windows["B"].append(b)
 
-    print(f"\n4. BRACKET RESOLUTION over {HORIZON_MINUTES} minutes")
-    print("   Of the times a symmetric bracket is resolved at all, how often")
-    print("   BOTH sides are hit inside ONE bar -- where this data cannot say")
-    print("   which came first.\n")
-    sample = rth[::SAMPLE_STRIDE]
+    labels = {"A": "09:30-10:50 ET (the traded window)",
+              "B": "rest of RTH"}
+    print("3. ONE-MINUTE BAR RANGES BY WINDOW\n")
+    ranges = {}
+    for key in ("A", "B"):
+        ranges[key] = [float(b.high - b.low) for b in windows[key]]
+        pcts = percentiles(ranges[key])
+        print(f"   {key}  {labels[key]}   ({len(ranges[key]):,} bars)")
+        print("      " + "  ".join(f"p{p}={pcts[p]:.2f}" for p in
+                                   ("10", "25", "50", "75", "90", "99")))
+        print(f"      mean {statistics.mean(ranges[key]):.2f} points\n")
+
+    # -- the sweep ---------------------------------------------------
     index = BarWindowIndex(bars)
-    print(f"   {'bracket':>9} {'resolved':>9} {'favorable':>10} "
-          f"{'adverse':>9} {'same bar':>10} {'unresolvable':>13}")
-    print("   " + "-" * 64)
     rows = []
-    progress = StageProgress("resolution", len(BRACKETS), unit="brackets",
-                             min_interval=0.0, counter_labels=("bars", "hits"))
-    for target in BRACKETS:
-        counts = {"favorable": 0, "adverse": 0, "same_bar": 0, "neither": 0}
-        for bar in sample:
-            measured = measure_forward_path("probe", bar.closed_at, bars,
-                                            HORIZON_MINUTES, index)
-            if measured is None:
-                continue
-            _path, scanner = measured
-            if not scanner.bars:
-                continue
-            outcome, _when = scanner.hit_first(Direction.UP, target, target)
-            counts[outcome] += 1
-        decided = counts["favorable"] + counts["adverse"] + counts["same_bar"]
-        share = (counts["same_bar"] / decided) if decided else 0.0
-        rows.append({"bracket_points": str(target), **counts,
-                     "same_bar_share_of_decided": share})
-        total = sum(counts.values()) or 1
-        print(f"   {float(target):>8.1f}p {decided / total:>8.1%} "
-              f"{counts['favorable'] / total:>9.1%} "
-              f"{counts['adverse'] / total:>8.1%} "
-              f"{share:>9.1%} {counts['neither'] / total:>12.1%}")
-        progress.advance(len(sample), decided)
+    total_steps = len(windows) * len(HORIZONS)
+    progress = StageProgress("sweep", total_steps, unit="window-horizons",
+                             min_interval=0.0, counter_labels=("anchors", "hits"))
+    for key in ("A", "B"):
+        sample = windows[key][::SAMPLE_STRIDE]
+        for horizon in HORIZONS:
+            counts = {str(b): {"favorable": 0, "adverse": 0, "same_bar": 0,
+                               "neither": 0} for b in BRACKETS}
+            measured_any = 0
+            for bar in sample:
+                measured = measure_forward_path("probe", bar.closed_at, bars,
+                                                horizon, index)
+                if measured is None:
+                    continue
+                _path, scanner = measured
+                if not scanner.bars:
+                    continue
+                measured_any += 1
+                for bracket in BRACKETS:
+                    outcome, _when = scanner.hit_first(Direction.UP, bracket,
+                                                       bracket)
+                    counts[str(bracket)][outcome] += 1
+            for bracket in BRACKETS:
+                c = counts[str(bracket)]
+                anchors = c["favorable"] + c["adverse"] + c["same_bar"] + c["neither"]
+                decided = c["favorable"] + c["adverse"] + c["same_bar"]
+                clean = c["favorable"] + c["adverse"]
+                rows.append({
+                    "window": key, "window_label": labels[key],
+                    "horizon_minutes": horizon, "bracket_points": str(bracket),
+                    "anchors": anchors, **c,
+                    "resolved": decided,
+                    "resolved_rate": decided / anchors if anchors else 0.0,
+                    "unresolved_rate": c["neither"] / anchors if anchors else 0.0,
+                    "favorable_rate": c["favorable"] / anchors if anchors else 0.0,
+                    "adverse_rate": c["adverse"] / anchors if anchors else 0.0,
+                    "same_bar_rate": c["same_bar"] / anchors if anchors else 0.0,
+                    "ambiguity_share_of_resolved":
+                        c["same_bar"] / decided if decided else 0.0,
+                    # same-bar counts as a failure
+                    "first_touch_conservative":
+                        c["favorable"] / decided if decided else None,
+                    # same-bar excluded
+                    "first_touch_diagnostic":
+                        c["favorable"] / clean if clean else None,
+                })
+            progress.advance(len(sample), measured_any)
     progress.finish()
 
-    print("\n5. READING THIS")
-    print("   'same bar' is the fraction of resolved cases where the")
-    print("   favourable and adverse levels were BOTH touched within one")
-    print("   minute. For those, one-minute data cannot say which came")
-    print("   first, so any study of a bracket that size is guessing on")
-    print("   that share of its sample. A high number at your bracket means")
-    print("   finer data is a precondition for the research, not an upgrade.")
+    # -- report ------------------------------------------------------
+    for key in ("A", "B"):
+        print(f"\n4{'A' if key == 'A' else 'B'}. WINDOW {key} -- {labels[key]}\n")
+        print(f"   {'h':>2} {'brkt':>5} {'anchors':>8} {'resolvd':>8} "
+              f"{'fav':>7} {'adv':>7} {'same':>7} {'unres':>7} "
+              f"{'ambig':>7} {'FT cons':>8} {'FT diag':>8}  verdict")
+        print("   " + "-" * 104)
+        for horizon in HORIZONS:
+            for r in [x for x in rows if x["window"] == key
+                      and x["horizon_minutes"] == horizon]:
+                ambiguous = r["ambiguity_share_of_resolved"] > MAX_AMBIGUITY_SHARE
+                rare = r["resolved_rate"] < LOW_REACHABILITY_SHARE
+                verdict = ("resolution-limited" if ambiguous else "measurable")
+                if rare:
+                    verdict += "; rarely reached"
+                cons = r["first_touch_conservative"]
+                diag = r["first_touch_diagnostic"]
+                print(f"   {horizon:>2} {float(r['bracket_points']):>5.1f} "
+                      f"{r['anchors']:>8,} {r['resolved']:>8,} "
+                      f"{r['favorable']:>7,} {r['adverse']:>7,} "
+                      f"{r['same_bar']:>7,} {r['neither']:>7,} "
+                      f"{r['ambiguity_share_of_resolved']:>7.1%} "
+                      f"{'' if cons is None else format(cons, '>8.1%')} "
+                      f"{'' if diag is None else format(diag, '>8.1%')}"
+                      f"  {verdict}")
+            print()
+
+    print("5. WHAT IS MEASURABLE WITH ONE-MINUTE OHLCV\n")
+    measurable = [r for r in rows
+                  if r["ambiguity_share_of_resolved"] <= MAX_AMBIGUITY_SHARE]
+    limited = [r for r in rows
+               if r["ambiguity_share_of_resolved"] > MAX_AMBIGUITY_SHARE]
+    print(f"   declared threshold: a combination is resolution-limited when")
+    print(f"   more than {MAX_AMBIGUITY_SHARE:.0%} of its RESOLVED cases are "
+          f"same-bar.\n")
+    for key in ("A", "B"):
+        ok = sorted({(r["horizon_minutes"], r["bracket_points"])
+                     for r in measurable if r["window"] == key})
+        bad = sorted({(r["horizon_minutes"], r["bracket_points"])
+                      for r in limited if r["window"] == key})
+        print(f"   window {key}  measurable      : "
+              f"{', '.join(f'{h}m/{b}p' for h, b in ok) or 'none'}")
+        print(f"   window {key}  resolution-limited: "
+              f"{', '.join(f'{h}m/{b}p' for h, b in bad) or 'none'}\n")
+    print("   Reachability is reported separately and is NOT a data problem:")
+    print("   a bracket that is rarely touched would be rarely touched in")
+    print("   tick data too. It bounds how often a trade completes, not")
+    print("   whether this data can see it.")
+    print("\n   The first-touch columns are the unconditional NULL. They are")
+    print("   the bar any conditional edge must clear, not a result.")
 
     report = {
-        "diagnostic": "scalp_resolution", "partition_used": "discovery",
-        "validation_read": False, "holdout_read": False,
-        "symbol": args.symbol, "sessions": len(days),
-        "rth_bars": len(ranges), "sample_stride": SAMPLE_STRIDE,
-        "horizon_minutes": HORIZON_MINUTES,
-        "bar_range_percentiles": {
-            str(p): ranges[min(len(ranges) - 1, int(len(ranges) * p / 100))]
-            for p in (10, 25, 50, 75, 90, 99)},
-        "bar_range_mean": statistics.mean(ranges),
-        "brackets": rows,
-        "manifest_sha256": manifest["sha256"],
+        "diagnostic": "scalp_resolution_reachability",
+        "partition_used": "discovery", "validation_read": False,
+        "holdout_read": False, "symbol": args.symbol, "sessions": len(days),
+        "opening_window_minutes": OPENING_WINDOW_MINUTES,
+        "sample_stride": SAMPLE_STRIDE,
+        "max_ambiguity_share": MAX_AMBIGUITY_SHARE,
+        "low_reachability_share": LOW_REACHABILITY_SHARE,
+        "bar_range_percentiles": {k: percentiles(v) for k, v in ranges.items()},
+        "bar_range_mean": {k: statistics.mean(v) for k, v in ranges.items()},
+        "bar_count": {k: len(v) for k, v in ranges.items()},
+        "rows": rows, "manifest_sha256": manifest["sha256"],
     }
     Path(args.out).write_text(json.dumps(report, indent=2, sort_keys=True,
                                          default=str))
