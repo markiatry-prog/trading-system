@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""Price the T-004 Phase B historical pull. DOWNLOADS NOTHING.
+"""Price a Databento historical pull. DOWNLOADS NOTHING.
+
+Covers two questions now:
+
+  T-004 (settled)  the one-minute pull that was bought for $19.25.
+  T-006 (open)     the minimum HIGH-RESOLUTION pull needed to research
+                   the scalp brackets one-minute bars cannot adjudicate.
+
+WHY A HIGH-RESOLUTION PULL IS EVEN BEING PRICED. The resolution
+diagnostic found that in the 09:30-10:50 ET window a 5-point symmetric
+bracket has both sides touched inside ONE minute in about 26% of
+resolved cases, and 7.5 points in about 11%. Ordering is unknowable
+there, so the lower half of the operator's stated range cannot be
+researched on one-minute data at all. 10 points is marginal, 15 and 20
+are fine.
+
+WHY THE WINDOWS END AT THE DISCOVERY BOUNDARY. The sealed holdout runs
+to the end of the acquired period. Buying high-resolution data over
+those dates would put a finer view of the final sample on disk, which
+is most of the way to having looked at it. Every candidate below
+therefore ends on 2024-03-01, inside discovery.
 
 WHY THIS IS A SCRIPT AND NOT A PASTED COMMAND
 
@@ -34,13 +54,22 @@ SCHEMA = "ohlcv-1m"
 SYMBOLS = ["NQ.c.0", "MNQ.c.0", "ES.c.0"]
 STYPE_IN = "continuous"
 CREDIT = 125.00
+SPENT = 19.25                      # the T-004 pull, already charged
 
-# The two candidates from the Phase B request. Five years is preferred on
-# power grounds; three is the fallback if the price is material.
+# T-004: settled, priced here only so the remaining credit is visible.
 CANDIDATES = [
-    ("5-year (recommended)", "2021-09-01", "2026-09-01"),
+    ("5-year (bought)", "2021-09-01", "2026-09-01"),
     ("3-year (fallback)", "2023-09-01", "2026-09-01"),
     ("1-year NQ only (floor)", "2025-09-01", "2026-09-01"),
+]
+
+# T-006: NQ only, and every window ends inside discovery so the sealed
+# holdout stays unbought as well as unread.
+HIGH_RESOLUTION = [
+    ("trades, 3 months", "trades", "2023-12-01", "2024-03-01"),
+    ("trades, 6 months", "trades", "2023-09-01", "2024-03-01"),
+    ("ohlcv-1s, 3 months", "ohlcv-1s", "2023-12-01", "2024-03-01"),
+    ("ohlcv-1s, 6 months", "ohlcv-1s", "2023-09-01", "2024-03-01"),
 ]
 
 
@@ -85,6 +114,56 @@ def main() -> int:
         except Exception as exc:                  # noqa: BLE001
             print(f"{label:26} {len(syms):>8}   ERROR {type(exc).__name__}: {exc}")
 
+    # -- T-006: the high-resolution comparison -----------------------
+    print("\n" + "=" * 74)
+    print("T-006 CANDIDATES -- minimum high-resolution NQ pull")
+    print("=" * 74)
+    print("NQ.c.0 only. Every window ends 2024-03-01, inside discovery, so")
+    print("the sealed holdout is not bought either.\n")
+    print(f"{'candidate':22} {'schema':10} {'records':>14} {'cost USD':>10} "
+          f"{'% credit left':>14}")
+    print("-" * 74)
+    remaining = CREDIT - SPENT
+    high = []
+    for label, schema, start, end in HIGH_RESOLUTION:
+        row = {"label": label, "schema": schema, "start": start, "end": end}
+        try:
+            cost = float(client.metadata.get_cost(
+                dataset=DATASET, schema=schema, symbols=["NQ.c.0"],
+                stype_in=STYPE_IN, start=start, end=end))
+            row["cost"] = cost
+        except Exception as exc:                  # noqa: BLE001
+            row["cost"] = None
+            row["cost_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            count = int(client.metadata.get_record_count(
+                dataset=DATASET, schema=schema, symbols=["NQ.c.0"],
+                stype_in=STYPE_IN, start=start, end=end))
+            row["records"] = count
+        except Exception as exc:                  # noqa: BLE001
+            row["records"] = None
+            row["count_error"] = f"{type(exc).__name__}: {exc}"
+        high.append(row)
+        cost_s = "  ERROR" if row["cost"] is None else f"{row['cost']:>10.2f}"
+        rec_s = "ERROR" if row["records"] is None else f"{row['records']:>14,}"
+        pct_s = ("" if row["cost"] is None
+                 else f"{100.0 * row['cost'] / remaining:>13.1f}%")
+        print(f"{label:22} {schema:10} {rec_s} {cost_s} {pct_s}")
+        for key in ("cost_error", "count_error"):
+            if key in row:
+                print(f"    {key}: {row[key]}")
+
+    print(f"\ncredit: ${CREDIT:.2f} granted, ${SPENT:.2f} spent on T-004, "
+          f"${remaining:.2f} remaining.")
+    print("\nSCHEMA NOTE, which the prices alone do not tell you:")
+    print("  trades    every execution, nanosecond stamped. First touch is")
+    print("            EXACT at any bracket. Also lets any bar interval be")
+    print("            rebuilt later, so it never needs buying twice.")
+    print("  ohlcv-1s  one-second OHLC. Ambiguity survives only when both")
+    print("            sides are touched inside the SAME SECOND, which is")
+    print("            far rarer than inside the same minute -- but it is")
+    print("            not zero, and it cannot be reconstructed away.")
+
     if results:
         print("\nrecommendation:")
         five = next((r for r in results if r[0].startswith("5-year")), None)
@@ -99,7 +178,9 @@ def main() -> int:
                 print(f"  fall back to 3-year: ${three[1]:.2f} ({three[2]:.1f}%).")
 
     print("\nNothing was downloaded. No charge has been incurred.")
-    print("Send these figures back for explicit approval before any pull.")
+    print("get_cost and get_record_count are metadata calls; neither moves")
+    print("market data. Send these figures back for explicit approval before")
+    print("any pull.")
     return 0
 
 
